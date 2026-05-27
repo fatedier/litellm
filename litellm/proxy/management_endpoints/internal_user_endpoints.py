@@ -1881,20 +1881,25 @@ async def get_user_key_counts(
     if not user_ids or len(user_ids) == 0:
         return {}
 
-    result: Final[dict[str, int]] = {}
+    result: Final[dict[str, int]] = {user_id: 0 for user_id in user_ids}
 
-    # Get count for each user_id individually
-    for user_id in user_ids:
-        count = await VerificationTokenRepository(prisma_client).table.count(
-            where={
-                "user_id": user_id,
-                "OR": [
-                    {"team_id": None},
-                    {"team_id": {"not": UI_SESSION_TOKEN_TEAM_ID}},
-                ],
-            }
-        )
-        result[user_id] = count
+    grouped_counts = await VerificationTokenRepository(prisma_client).table.group_by(
+        by=["user_id"],
+        where={
+            "user_id": {"in": user_ids},
+            "OR": [
+                {"team_id": None},
+                {"team_id": {"not": UI_SESSION_TOKEN_TEAM_ID}},
+            ],
+        },
+        count={"user_id": True},
+    )
+
+    for row in grouped_counts:
+        grouped_user_id = row.get("user_id")
+        if grouped_user_id is None:
+            continue
+        result[grouped_user_id] = row["_count"]["user_id"]
 
     return result
 
