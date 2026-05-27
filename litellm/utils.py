@@ -8278,6 +8278,12 @@ class ProviderConfigManager:
             )
 
             return JSONProviderAnthropicMessagesConfig(json_provider)
+        elif litellm.LlmProviders.DASHSCOPE == provider:
+            from litellm.llms.dashscope.messages.transformation import (
+                DashScopeAnthropicMessagesConfig,
+            )
+
+            return DashScopeAnthropicMessagesConfig()
         return None
 
     @staticmethod
