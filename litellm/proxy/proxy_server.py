@@ -576,6 +576,9 @@ from litellm.proxy.route_llm_request import route_request
 from litellm.proxy.search_endpoints.endpoints import router as search_router
 from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
 from litellm.proxy.spend_tracking.budget_reservation import get_budget_window_start
+from litellm.proxy.spend_tracking.spend_ingestion_endpoints import (
+    router as spend_ingestion_router,
+)
 from litellm.proxy.spend_tracking.spend_management_endpoints import (
     router as spend_management_router,
 )
@@ -17219,6 +17222,7 @@ app.include_router(ui_sso_router)
 app.include_router(organization_router)
 app.include_router(customer_router)
 app.include_router(management_v1_router)
+app.include_router(spend_ingestion_router)
 app.include_router(spend_management_router)
 app.include_router(caching_router)
 app.include_router(analytics_router)

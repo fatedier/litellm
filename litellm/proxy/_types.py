@@ -590,9 +590,11 @@ class LiteLLMRoutes(enum.Enum):
         "/get/user_banner",
     ]
 
-    # NOTE: ROUTES ONLY FOR MASTER KEY - only the Master Key should be able to Reset Spend
+    # NOTE: ROUTES ONLY FOR MASTER KEY - only the Master Key should be able to
+    # call proxy-admin/internal spend routes.
     master_key_only_routes = [
         "/global/spend/reset",
+        "/internal/spend/ingest",
         "/memory-usage-in-mem-cache",
         "/memory-usage-in-mem-cache-items",
     ]
