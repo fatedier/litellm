@@ -9491,7 +9491,51 @@ class ProxyStartupEvent:
 
 
 #### API ENDPOINTS ####
-@router.get("/v1/models", dependencies=[Depends(user_api_key_auth)], tags=["model management"])
+def _append_advertised_models_to_model_data(
+    model_data: list[dict],
+    general_settings: dict | None,
+) -> list[dict]:
+    if not isinstance(general_settings, dict):
+        return model_data
+
+    advertised_models = general_settings.get("advertised_models") or []
+    if not isinstance(advertised_models, list):
+        return model_data
+
+    from litellm.proxy.utils import create_model_info_response
+
+    model_index_by_id = {
+        model["id"]: idx
+        for idx, model in enumerate(model_data)
+        if isinstance(model.get("id"), str)
+    }
+
+    for advertised_model in advertised_models:
+        if not isinstance(advertised_model, dict):
+            continue
+        model_id = str(advertised_model.get("id") or "").strip()
+        if not model_id:
+            continue
+
+        owned_by = str(advertised_model.get("owned_by") or "openai").strip()
+        if not owned_by:
+            owned_by = "openai"
+        model_info = create_model_info_response(model_id=model_id, provider=owned_by)
+        metadata = advertised_model.get("metadata")
+        if isinstance(metadata, dict):
+            model_info["metadata"] = copy.deepcopy(metadata)
+
+        existing_idx = model_index_by_id.get(model_id)
+        if existing_idx is None:
+            model_index_by_id[model_id] = len(model_data)
+            model_data.append(model_info)
+
+    return model_data
+
+
+@router.get(
+    "/v1/models", dependencies=[Depends(user_api_key_auth)], tags=["model management"]
+)
 @router.get(
     "/models", dependencies=[Depends(user_api_key_auth)], tags=["model management"]
 )  # if project requires model list
@@ -9632,6 +9676,12 @@ async def model_list(
             model_info["id"] = response_id
             model_data.append(model_info)
 
+        if not wants_anthropic_format and not only_model_access_groups:
+            model_data = _append_advertised_models_to_model_data(
+                model_data=model_data,
+                general_settings=general_settings,
+            )
+
         if wants_anthropic_format:
             admin_listing: Final = cast(Sequence[ModelInfoResponse], model_data)  # cast-ok: rows built above
             return create_anthropic_model_list_response(admin_listing)
@@ -9675,6 +9725,12 @@ async def model_list(
         )
         model_info["id"] = response_id
         model_data.append(model_info)
+
+    if not wants_anthropic_format and not only_model_access_groups:
+        model_data = _append_advertised_models_to_model_data(
+            model_data=model_data,
+            general_settings=general_settings,
+        )
 
     if wants_anthropic_format:
         listing: Final = cast(Sequence[ModelInfoResponse], model_data)  # cast-ok: rows built above

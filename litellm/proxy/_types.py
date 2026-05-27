@@ -2433,6 +2433,10 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
         None,
         description="for `/models` endpoint, infers available model based on environment keys (e.g. OPENAI_API_KEY)",
     )
+    advertised_models: list[dict[str, Any]] | None = Field(
+        None,
+        description="Additional catalog-only models returned by `/v1/models`. These are not registered with the LiteLLM router.",
+    )
     background_health_checks: bool | None = Field(None, description="run health checks in background")
     health_check_interval: int = Field(300, description="background health check interval in seconds")
     health_check_concurrency: int | None = Field(

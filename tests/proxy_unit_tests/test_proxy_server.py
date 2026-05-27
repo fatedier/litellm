@@ -2106,6 +2106,68 @@ async def test_gemini_pass_through_endpoint():
     print(resp.body)
 
 
+@pytest.mark.asyncio
+async def test_model_list_includes_public_advertised_models(monkeypatch):
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.proxy_server import model_list
+
+    router = mock.MagicMock()
+    router.get_model_names.return_value = ["gpt-4.1"]
+    router.get_model_access_groups.return_value = {}
+    router.get_configured_token_limits.return_value = (None, None)
+
+    monkeypatch.setattr(litellm.proxy.proxy_server, "llm_router", router)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", None)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", None)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "proxy_logging_obj", None)
+    monkeypatch.setattr(
+        litellm.proxy.proxy_server,
+        "general_settings",
+        {
+            "advertised_models": [
+                {
+                    "id": "gpt-realtime-2",
+                    "owned_by": "openai",
+                    "metadata": {
+                        "endpoint": "/openai/passthrough/v1/realtime",
+                        "transport": "websocket",
+                    },
+                },
+                {
+                    "id": "gpt-4.1",
+                    "metadata": {"endpoint": "/should-not-override"},
+                },
+            ]
+        },
+    )
+
+    unrestricted_resp = await model_list(user_api_key_dict=UserAPIKeyAuth(models=[]))
+    unrestricted_models = unrestricted_resp["data"]
+    assert [model["id"] for model in unrestricted_models] == [
+        "gpt-4.1",
+        "gpt-realtime-2",
+    ]
+    router_model = next(
+        model for model in unrestricted_models if model["id"] == "gpt-4.1"
+    )
+    assert "metadata" not in router_model
+    realtime_model = next(
+        model for model in unrestricted_models if model["id"] == "gpt-realtime-2"
+    )
+    assert realtime_model["metadata"] == {
+        "endpoint": "/openai/passthrough/v1/realtime",
+        "transport": "websocket",
+    }
+
+    public_catalog_resp = await model_list(
+        user_api_key_dict=UserAPIKeyAuth(models=["gpt-4.1"])
+    )
+    assert [model["id"] for model in public_catalog_resp["data"]] == [
+        "gpt-4.1",
+        "gpt-realtime-2",
+    ]
+
+
 @pytest.mark.parametrize("hidden", [True, False])
 @pytest.mark.asyncio
 async def test_model_info_alias_without_prisma(hidden):
