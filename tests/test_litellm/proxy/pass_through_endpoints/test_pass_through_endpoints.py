@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+import types
 from contextlib import ExitStack, contextmanager
 from io import BytesIO
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from fastapi import Request, UploadFile
+from fastapi import FastAPI, Request, Response, UploadFile
 from starlette.datastructures import FormData, Headers, QueryParams
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
@@ -806,6 +807,76 @@ async def test_initialize_pass_through_endpoints_with_include_subpath():
                     subpath_call_args = mock_add_subpath_route.call_args[1]
                     assert subpath_call_args["path"] == "/test/endpoint"
                     assert subpath_call_args["target"] == "http://example.com"
+
+
+@pytest.mark.asyncio
+async def test_initialize_pass_through_endpoints_removes_only_stale_route_keys():
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        InitPassThroughEndpointHelpers,
+        _registered_pass_through_routes,
+        initialize_pass_through_endpoints,
+    )
+
+    old_registry = dict(_registered_pass_through_routes)
+    _registered_pass_through_routes.clear()
+
+    endpoint_id = "stable-endpoint"
+    old_methods = ["POST"]
+    old_methods_str = ",".join(sorted(old_methods))
+    stale_exact_key = f"{endpoint_id}:exact:/test/endpoint:{old_methods_str}"
+
+    try:
+        InitPassThroughEndpointHelpers.add_exact_path_route(
+            app=FastAPI(),
+            path="/test/endpoint",
+            target="http://example.com/old",
+            custom_headers={},
+            forward_headers=False,
+            merge_query_params=False,
+            dependencies=[],
+            cost_per_request=0.0,
+            endpoint_id=endpoint_id,
+            methods=old_methods,
+        )
+        assert stale_exact_key in _registered_pass_through_routes
+
+        endpoints = [
+            {
+                "id": endpoint_id,
+                "path": "/test/endpoint",
+                "target": "http://example.com/new",
+                "include_subpath": True,
+                "methods": ["GET", "POST"],
+            }
+        ]
+
+        mock_proxy_server = types.ModuleType("litellm.proxy.proxy_server")
+        mock_proxy_server.app = FastAPI()
+        mock_proxy_server.config_passthrough_endpoints = None
+        mock_proxy_server.premium_user = False
+
+        with (
+            patch.dict(
+                sys.modules,
+                {"litellm.proxy.proxy_server": mock_proxy_server},
+            ),
+            patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.set_env_variables_in_header"
+            ) as mock_set_env,
+        ):
+            mock_set_env.return_value = {}
+            await initialize_pass_through_endpoints(endpoints)
+
+        new_methods_str = ",".join(sorted(["GET", "POST"]))
+        new_exact_key = f"{endpoint_id}:exact:/test/endpoint:{new_methods_str}"
+        new_subpath_key = f"{endpoint_id}:subpath:/test/endpoint:{new_methods_str}"
+
+        assert stale_exact_key not in _registered_pass_through_routes
+        assert new_exact_key in _registered_pass_through_routes
+        assert new_subpath_key in _registered_pass_through_routes
+    finally:
+        _registered_pass_through_routes.clear()
+        _registered_pass_through_routes.update(old_registry)
 
 
 @pytest.mark.asyncio

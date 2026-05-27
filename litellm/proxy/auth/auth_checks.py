@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 import litellm
 from litellm._logging import verbose_proxy_logger
-from litellm.caching.dual_cache import LimitedSizeOrderedDict
+from litellm.caching.dual_cache import DualCache, LimitedSizeOrderedDict
 from litellm.constants import (
     CLI_JWT_EXPIRATION_HOURS,
     CLI_SESSION_KEY_PREFIX,
@@ -253,6 +253,8 @@ _safe_json_loads_obj: Final = _typed_json_loads(safe_json_loads)
 
 last_db_access_time: Final = LimitedSizeOrderedDict(max_size=100)
 db_cache_expiry: Final = DEFAULT_IN_MEMORY_TTL  # refresh every 5s
+DAILY_USER_BUDGET_MULTIPLIER = 4.5
+DAILY_USER_SPEND_CACHE_TTL = 60
 
 all_routes: Final = LiteLLMRoutes.openai_routes.value + LiteLLMRoutes.management_routes.value
 
@@ -443,6 +445,176 @@ def _is_cost_explicitly_configured(model: str, llm_router: "Router") -> bool:
         if "input_cost_per_token" in raw_entry or "output_cost_per_token" in raw_entry:
             return True
     return False
+
+
+def _get_supported_budget_duration_days(
+    budget_duration: Optional[str],
+) -> Optional[int]:
+    """
+    Return the number of days represented by supported budget durations.
+
+    Supported formats are:
+    - Nd
+    - Nmo (treated as N * 30 days)
+    """
+    if budget_duration is None:
+        return None
+
+    normalized_duration = budget_duration.strip().lower()
+    if normalized_duration.endswith("mo"):
+        month_value = normalized_duration[:-2]
+        if not month_value.isdigit():
+            return None
+
+        duration_months = int(month_value)
+        if duration_months <= 0:
+            return None
+
+        return duration_months * 30
+
+    if not normalized_duration.endswith("d"):
+        return None
+
+    duration_value = normalized_duration[:-1]
+    if not duration_value.isdigit():
+        return None
+
+    duration_days = int(duration_value)
+    if duration_days <= 0:
+        return None
+
+    return duration_days
+
+
+def _get_daily_user_spend_cache_key(user_id: str, utc_date: str) -> str:
+    return f"daily_user_spend:{user_id}:{utc_date}"
+
+
+def _get_daily_user_budget_mode(
+    general_settings: dict[str, Any] | None,
+) -> Literal["off", "log_only", "enforce"] | None:
+    if general_settings is None:
+        return None
+
+    raw_mode = general_settings.get("daily_user_budget_mode")
+    if not isinstance(raw_mode, str):
+        return None
+
+    normalized_mode = raw_mode.strip().lower()
+    if normalized_mode in {"off", "log_only", "enforce"}:
+        return cast(Literal["off", "log_only", "enforce"], normalized_mode)
+
+    verbose_proxy_logger.warning(
+        "Invalid daily_user_budget_mode=%s. Skipping daily budget check.",
+        raw_mode,
+    )
+    return None
+
+
+async def _get_user_utc_daily_spend(
+    user_id: str,
+    utc_date: str,
+    prisma_client: Optional[PrismaClient],
+    user_api_key_cache: DualCache,
+) -> Optional[float]:
+    cache_key = _get_daily_user_spend_cache_key(user_id=user_id, utc_date=utc_date)
+    cached_daily_spend = await user_api_key_cache.async_get_cache(key=cache_key)
+    if cached_daily_spend is not None:
+        try:
+            return float(cached_daily_spend)
+        except (TypeError, ValueError):
+            verbose_proxy_logger.warning(
+                "Invalid cached UTC daily spend for user %s on %s: %s",
+                user_id,
+                utc_date,
+                cached_daily_spend,
+            )
+
+    if prisma_client is None:
+        return None
+
+    try:
+        response = await prisma_client.db.litellm_dailyuserspend.group_by(
+            by=["user_id", "date"],
+            where={
+                "user_id": user_id,
+                "date": utc_date,
+            },
+            sum={"spend": True},
+        )
+        daily_spend = 0.0
+        if isinstance(response, list) and len(response) > 0:
+            daily_spend = float((response[0].get("_sum") or {}).get("spend") or 0.0)
+
+        # Best-effort guardrail only: we intentionally do not invalidate this on
+        # every spend write, to avoid extra hot-path churn. Daily-cap enforcement
+        # can therefore lag by up to the cache TTL.
+        await user_api_key_cache.async_set_cache(
+            key=cache_key,
+            value=daily_spend,
+            ttl=DAILY_USER_SPEND_CACHE_TTL,
+        )
+        return daily_spend
+    except Exception as e:
+        verbose_proxy_logger.warning(
+            "Failed to lookup UTC daily spend for user %s on %s. Skipping daily budget check. Error: %s",
+            user_id,
+            utc_date,
+            e,
+        )
+        return None
+
+
+async def _personal_user_daily_budget_check(
+    user_object: LiteLLM_UserTable,
+    prisma_client: Optional[PrismaClient],
+    user_api_key_cache: DualCache,
+    general_settings: dict[str, Any] | None = None,
+) -> None:
+    if user_object.max_budget is None:
+        return
+
+    daily_user_budget_mode = _get_daily_user_budget_mode(general_settings)
+    if daily_user_budget_mode in {None, "off"}:
+        return
+
+    period_days = _get_supported_budget_duration_days(user_object.budget_duration)
+    if period_days is None:
+        return
+
+    utc_date = get_utc_datetime().strftime("%Y-%m-%d")
+    # Current deployment uses internal-user personal keys only, so summing by
+    # user/day is intentional here. If team-key traffic is added for these users
+    # later, this lookup should exclude team-key spend.
+    today_spend = await _get_user_utc_daily_spend(
+        user_id=user_object.user_id,
+        utc_date=utc_date,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+    )
+    if today_spend is None:
+        return
+
+    daily_cap = (user_object.max_budget / period_days) * DAILY_USER_BUDGET_MULTIPLIER
+    if daily_cap < today_spend:
+        if daily_user_budget_mode == "log_only":
+            verbose_proxy_logger.warning(
+                "User %s exceeded UTC daily cap. Date=%s, Spend=%s, DailyCap=%s. daily_user_budget_mode=log_only; allowing request.",
+                user_object.user_id,
+                utc_date,
+                today_spend,
+                daily_cap,
+            )
+            return
+
+        raise litellm.BudgetExceededError(
+            current_cost=today_spend,
+            max_budget=daily_cap,
+            message=(
+                f"ExceededBudget: User={user_object.user_id} exceeded UTC daily cap. "
+                f"Date={utc_date}, Spend={today_spend}, DailyCap={daily_cap}"
+            ),
+        )
 
 
 async def _run_project_checks(
@@ -819,6 +991,13 @@ async def common_checks(
             is_team_key: Final = team_object is not None and team_object.team_id is not None
             if is_team_key and general_settings.get("apply_user_budget_to_team_keys") is not True:
                 return
+            if not is_team_key:
+                await _personal_user_daily_budget_check(
+                    user_object=user_object,
+                    prisma_client=prisma_client,
+                    user_api_key_cache=user_api_key_cache,
+                    general_settings=general_settings,
+                )
 
             from litellm.proxy.proxy_server import get_current_spend
 

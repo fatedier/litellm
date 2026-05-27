@@ -2475,6 +2475,10 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
         None,
         description="When set to True, rejects requests that contain client-side 'metadata.tags' to prevent users from influencing budgets by sending different tags. Tags can only be inherited from the API key metadata.",
     )
+    daily_user_budget_mode: Literal["off", "log_only", "enforce"] | None = Field(
+        None,
+        description="Opt-in control for UTC daily user-budget guardrails on personal keys. When unset or 'off', the check is disabled. 'log_only' only logs cap violations, and 'enforce' blocks over-cap requests.",
+    )
     enable_public_model_hub: bool = Field(
         default=False,
         description="Public model hub for users to see what models they have access to, supported openai params, etc.",

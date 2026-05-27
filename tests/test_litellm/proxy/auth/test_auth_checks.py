@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sys
+import types
 from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(
@@ -31,12 +32,14 @@ from litellm.proxy._types import (
     UserAPIKeyAuth,
 )
 from litellm.proxy.auth.auth_checks import (
+    DAILY_USER_BUDGET_MULTIPLIER,
     ExperimentalUIJWTToken,
     _cache_management_object,
     _can_object_call_model,
     _can_object_call_vector_stores,
     _check_end_user_budget,
     _check_team_member_budget,
+    _get_supported_budget_duration_days,
     _get_fuzzy_user_object,
     _get_team_db_check,
     _log_budget_lookup_failure,
@@ -45,10 +48,12 @@ from litellm.proxy.auth.auth_checks import (
     _virtual_key_max_budget_alert_check,
     _virtual_key_max_budget_check,
     _virtual_key_soft_budget_check,
+    common_checks,
     get_key_object,
     get_user_object,
     vector_store_access_check,
 )
+from litellm.caching.caching import DualCache
 from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.caching.redis_cache import RedisCache
 from litellm.constants import DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL
@@ -2325,6 +2330,326 @@ async def test_reject_clientside_metadata_tags_non_llm_route():
     )
 
     assert result is True
+
+
+@pytest.mark.parametrize(
+    "budget_duration, expected_days",
+    [
+        ("30d", 30),
+        ("7d", 7),
+        ("1mo", 30),
+        ("2mo", 60),
+        ("24h", None),
+        ("30m", None),
+        ("invalid", None),
+    ],
+)
+def test_get_supported_budget_duration_days(budget_duration, expected_days):
+    assert _get_supported_budget_duration_days(budget_duration) == expected_days
+
+
+async def _run_common_checks_for_daily_user_budget(
+    user_object: LiteLLM_UserTable,
+    mock_prisma_client: MagicMock,
+    cache: DualCache,
+    *,
+    team_object=None,
+    general_settings=None,
+):
+    from fastapi import Request
+
+    fixed_utc_now = datetime(2026, 3, 30, 1, 2, 3)
+    mock_request = MagicMock(spec=Request)
+    valid_token = UserAPIKeyAuth(token="test-token", user_id=user_object.user_id)
+    general_settings = general_settings or {}
+    mock_proxy_server = types.ModuleType("litellm.proxy.proxy_server")
+    mock_proxy_server.prisma_client = mock_prisma_client
+    mock_proxy_server.user_api_key_cache = cache
+    mock_proxy_server.general_settings = general_settings
+    mock_proxy_server.premium_user = False
+    mock_proxy_server.proxy_logging_obj = MagicMock()
+    mock_proxy_server.get_current_spend = AsyncMock(
+        return_value=user_object.spend or 0.0
+    )
+
+    with (
+        patch.dict(
+            sys.modules,
+            {"litellm.proxy.proxy_server": mock_proxy_server},
+        ),
+        patch(
+            "litellm.proxy.auth.auth_checks.get_utc_datetime",
+            return_value=fixed_utc_now,
+        ),
+        patch(
+            "litellm.proxy.auth.auth_checks._check_team_member_budget",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "litellm.proxy.auth.auth_checks._check_team_member_model_access",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "litellm.proxy.auth.auth_checks._guardrail_modification_check",
+            return_value=None,
+        ),
+        patch(
+            "litellm.proxy.auth.auth_checks.organization_role_based_access_check",
+            return_value=None,
+        ),
+        patch(
+            "litellm.proxy.auth.auth_checks._is_api_route_allowed",
+            return_value=True,
+        ),
+        patch(
+            "litellm.proxy.auth.auth_checks.vector_store_access_check",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "litellm.proxy.auth.auth_checks.check_tools_allowlist",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        return await common_checks(
+            request_body={"model": "gpt-3.5-turbo"},
+            team_object=team_object,
+            user_object=user_object,
+            end_user_object=None,
+            global_proxy_spend=None,
+            general_settings=general_settings,
+            route="/chat/completions",
+            llm_router=None,
+            proxy_logging_obj=MagicMock(),
+            valid_token=valid_token,
+            request=mock_request,
+        )
+
+
+@pytest.mark.asyncio
+async def test_common_checks_blocks_personal_user_when_utc_daily_cap_exceeded():
+    user_object = LiteLLM_UserTable(
+        user_id="test-user",
+        max_budget=1000.0,
+        spend=100.0,
+        budget_duration="30d",
+    )
+    mock_prisma_client = MagicMock()
+    mock_prisma_client.db.litellm_dailyuserspend.group_by = AsyncMock(
+        return_value=[
+            {
+                "user_id": "test-user",
+                "date": "2026-03-30",
+                "_sum": {"spend": 160.0},
+            }
+        ]
+    )
+    cache = DualCache()
+
+    with pytest.raises(litellm.BudgetExceededError) as exc_info:
+        await _run_common_checks_for_daily_user_budget(
+            user_object=user_object,
+            mock_prisma_client=mock_prisma_client,
+            cache=cache,
+            general_settings={"daily_user_budget_mode": "enforce"},
+        )
+
+    assert exc_info.value.current_cost == 160.0
+    assert exc_info.value.max_budget == pytest.approx(
+        (1000.0 / 30) * DAILY_USER_BUDGET_MULTIPLIER
+    )
+    assert "UTC daily cap" in exc_info.value.message
+    mock_prisma_client.db.litellm_dailyuserspend.group_by.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_common_checks_allows_personal_user_when_utc_daily_cap_equal():
+    user_object = LiteLLM_UserTable(
+        user_id="equal-user",
+        max_budget=100.0,
+        spend=20.0,
+        budget_duration="10d",
+    )
+    mock_prisma_client = MagicMock()
+    mock_prisma_client.db.litellm_dailyuserspend.group_by = AsyncMock(
+        return_value=[
+            {
+                "user_id": "equal-user",
+                "date": "2026-03-30",
+                "_sum": {"spend": 20.0},
+            }
+        ]
+    )
+    cache = DualCache()
+
+    result = await _run_common_checks_for_daily_user_budget(
+        user_object=user_object,
+        mock_prisma_client=mock_prisma_client,
+        cache=cache,
+        general_settings={"daily_user_budget_mode": "enforce"},
+    )
+
+    assert result is True
+    mock_prisma_client.db.litellm_dailyuserspend.group_by.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_common_checks_skips_utc_daily_cap_for_unsupported_budget_duration():
+    user_object = LiteLLM_UserTable(
+        user_id="hourly-user",
+        max_budget=100.0,
+        spend=10.0,
+        budget_duration="24h",
+    )
+    mock_prisma_client = MagicMock()
+    mock_prisma_client.db.litellm_dailyuserspend.group_by = AsyncMock()
+    cache = DualCache()
+
+    result = await _run_common_checks_for_daily_user_budget(
+        user_object=user_object,
+        mock_prisma_client=mock_prisma_client,
+        cache=cache,
+    )
+
+    assert result is True
+    mock_prisma_client.db.litellm_dailyuserspend.group_by.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_common_checks_skips_utc_daily_cap_for_team_keys():
+    user_object = LiteLLM_UserTable(
+        user_id="team-user",
+        max_budget=1000.0,
+        spend=10.0,
+        budget_duration="30d",
+    )
+    team_object = LiteLLM_TeamTable(team_id="team-123", models=["gpt-3.5-turbo"])
+    mock_prisma_client = MagicMock()
+    mock_prisma_client.db.litellm_dailyuserspend.group_by = AsyncMock()
+    cache = DualCache()
+
+    result = await _run_common_checks_for_daily_user_budget(
+        user_object=user_object,
+        mock_prisma_client=mock_prisma_client,
+        cache=cache,
+        team_object=team_object,
+    )
+
+    assert result is True
+    mock_prisma_client.db.litellm_dailyuserspend.group_by.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_common_checks_uses_cached_daily_spend_without_db_lookup():
+    user_object = LiteLLM_UserTable(
+        user_id="cached-user",
+        max_budget=1000.0,
+        spend=50.0,
+        budget_duration="30d",
+    )
+    mock_prisma_client = MagicMock()
+    mock_prisma_client.db.litellm_dailyuserspend.group_by = AsyncMock()
+    cache = DualCache()
+    await cache.async_set_cache(
+        key="daily_user_spend:cached-user:2026-03-30",
+        value=160.0,
+        ttl=60,
+    )
+
+    with pytest.raises(litellm.BudgetExceededError):
+        await _run_common_checks_for_daily_user_budget(
+            user_object=user_object,
+            mock_prisma_client=mock_prisma_client,
+            cache=cache,
+            general_settings={"daily_user_budget_mode": "enforce"},
+        )
+
+    mock_prisma_client.db.litellm_dailyuserspend.group_by.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_common_checks_skips_utc_daily_cap_when_mode_off():
+    user_object = LiteLLM_UserTable(
+        user_id="mode-off-user",
+        max_budget=1000.0,
+        spend=50.0,
+        budget_duration="30d",
+    )
+    mock_prisma_client = MagicMock()
+    mock_prisma_client.db.litellm_dailyuserspend.group_by = AsyncMock()
+    cache = DualCache()
+
+    result = await _run_common_checks_for_daily_user_budget(
+        user_object=user_object,
+        mock_prisma_client=mock_prisma_client,
+        cache=cache,
+        general_settings={"daily_user_budget_mode": "off"},
+    )
+
+    assert result is True
+    mock_prisma_client.db.litellm_dailyuserspend.group_by.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_common_checks_skips_utc_daily_cap_when_mode_missing():
+    user_object = LiteLLM_UserTable(
+        user_id="mode-missing-user",
+        max_budget=1000.0,
+        spend=50.0,
+        budget_duration="30d",
+    )
+    mock_prisma_client = MagicMock()
+    mock_prisma_client.db.litellm_dailyuserspend.group_by = AsyncMock()
+    cache = DualCache()
+
+    result = await _run_common_checks_for_daily_user_budget(
+        user_object=user_object,
+        mock_prisma_client=mock_prisma_client,
+        cache=cache,
+    )
+
+    assert result is True
+    mock_prisma_client.db.litellm_dailyuserspend.group_by.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_common_checks_logs_only_when_mode_log_only():
+    user_object = LiteLLM_UserTable(
+        user_id="mode-log-only-user",
+        max_budget=1000.0,
+        spend=50.0,
+        budget_duration="30d",
+    )
+    mock_prisma_client = MagicMock()
+    mock_prisma_client.db.litellm_dailyuserspend.group_by = AsyncMock(
+        return_value=[
+            {
+                "user_id": "mode-log-only-user",
+                "date": "2026-03-30",
+                "_sum": {"spend": 160.0},
+            }
+        ]
+    )
+    cache = DualCache()
+
+    with patch(
+        "litellm.proxy.auth.auth_checks.verbose_proxy_logger.warning"
+    ) as mock_warning:
+        result = await _run_common_checks_for_daily_user_budget(
+            user_object=user_object,
+            mock_prisma_client=mock_prisma_client,
+            cache=cache,
+            general_settings={"daily_user_budget_mode": "log_only"},
+        )
+
+    assert result is True
+    mock_prisma_client.db.litellm_dailyuserspend.group_by.assert_awaited_once()
+    mock_warning.assert_any_call(
+        "User %s exceeded UTC daily cap. Date=%s, Spend=%s, DailyCap=%s. daily_user_budget_mode=log_only; allowing request.",
+        "mode-log-only-user",
+        "2026-03-30",
+        160.0,
+        pytest.approx((1000.0 / 30) * DAILY_USER_BUDGET_MULTIPLIER),
+    )
 
 
 @pytest.mark.asyncio

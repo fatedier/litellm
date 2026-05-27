@@ -1503,6 +1503,12 @@ async def pass_through_request(
                 "pass_through_endpoint: request blocked by guardrail - %s",
                 str(e),
             )
+        elif isinstance(e, HTTPException) and e.status_code < 500:
+            verbose_proxy_logger.warning(
+                "litellm.proxy.proxy_server.pass_through_endpoint(): Exception occured - {}".format(
+                    str(e)
+                )
+            )
         else:
             verbose_proxy_logger.exception(
                 "litellm.proxy.proxy_server.pass_through_endpoint(): Exception occured - %s", e
