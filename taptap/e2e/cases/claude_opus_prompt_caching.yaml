@@ -1,0 +1,270 @@
+suite_version: 1
+id: claude_opus_prompt_caching
+patch_id: claude_opus_4_8_prompt_caching
+status: active
+description: Verify claude-opus-4-8 prompt caching usage and spend are correct across repeated Anthropic messages requests.
+
+variables:
+  opus_key_alias: taptap-e2e-claude-opus-48-${run_id}
+  cacheable_document:
+    repeat:
+      count: 32
+      separator: "\n"
+      text: "Unique cache seed ${run_id}. This section of the agreement covers confidentiality, payment, liability, intellectual property, termination, dispute resolution, audit rights, indemnification, and data handling obligations for both parties."
+
+shared:
+  timeout_seconds: 90
+  headers:
+    Content-Type: application/json
+
+scenarios:
+  - id: repeated_messages_use_prompt_cache_and_bill_correctly
+    description: The first Anthropic messages call should create cache, the second should read cache, and both spends should match pricing.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_claude_opus_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            key_alias: ${opus_key_alias}
+            models:
+              - claude-opus-4-8
+        expect:
+          status: 200
+          json_exists:
+            - key
+        save:
+          - from: json.key
+            as: opus_key
+          - from: json.token
+            as: opus_key_hash
+
+      - id: public_model_cost_map_has_claude_opus_4_8
+        request:
+          method: GET
+          path: /public/litellm_model_cost_map
+        expect:
+          status: 200
+          json_equals:
+            claude-opus-4-8.supports_prompt_caching: true
+            claude-opus-4-8.litellm_provider: anthropic
+            claude-opus-4-8.mode: chat
+        save:
+          - from: json.claude-opus-4-8.input_cost_per_token
+            as: opus_input_cost_per_token
+          - from: json.claude-opus-4-8.output_cost_per_token
+            as: opus_output_cost_per_token
+          - from: json.claude-opus-4-8.cache_creation_input_token_cost
+            as: opus_cache_creation_input_token_cost
+          - from: json.claude-opus-4-8.cache_read_input_token_cost
+            as: opus_cache_read_input_token_cost
+
+      - id: opus_key_can_see_claude_opus_4_8
+        request:
+          method: GET
+          path: /models
+          headers:
+            Authorization: Bearer ${opus_key}
+        expect:
+          status: 200
+          body_contains:
+            - claude-opus-4-8
+
+      - id: first_messages_call_creates_cache
+        request:
+          method: POST
+          path: /v1/messages
+          headers:
+            Authorization: Bearer ${opus_key}
+            anthropic-version: "2023-06-01"
+          json:
+            model: claude-opus-4-8
+            max_tokens: 64
+            messages:
+              - role: user
+                content:
+                  - type: text
+                    text: ${cacheable_document}
+                    cache_control:
+                      type: ephemeral
+                  - type: text
+                    text: Summarize the agreement in one short sentence.
+        expect:
+          status: 200
+          json_exists:
+            - usage.input_tokens
+            - usage.output_tokens
+            - usage.cache_creation_input_tokens
+            - usage.cache_read_input_tokens
+          json_number_gte:
+            usage.cache_creation_input_tokens: 1
+          json_equals:
+            usage.cache_read_input_tokens: 0
+        save:
+          - from: json.usage.input_tokens
+            as: opus_first_input_tokens
+          - from: json.usage.output_tokens
+            as: opus_first_output_tokens
+          - from: json.usage.cache_creation_input_tokens
+            as: opus_first_cache_creation_input_tokens
+          - from: json.usage.cache_read_input_tokens
+            as: opus_first_cache_read_input_tokens
+
+      - id: estimate_first_opus_cost
+        cost_estimate:
+          usage:
+            input_text_tokens: ${opus_first_input_tokens}
+            output_text_tokens: ${opus_first_output_tokens}
+            cache_creation_input_tokens: ${opus_first_cache_creation_input_tokens}
+            cache_read_input_tokens: ${opus_first_cache_read_input_tokens}
+          pricing:
+            input_cost_per_token: ${opus_input_cost_per_token}
+            output_cost_per_token: ${opus_output_cost_per_token}
+            cache_creation_input_token_cost: ${opus_cache_creation_input_token_cost}
+            cache_read_input_token_cost: ${opus_cache_read_input_token_cost}
+          tolerance:
+            absolute: 0.000001
+            percent: 0.01
+        save:
+          - from: estimate.min_cost
+            as: opus_first_expected_min_cost
+          - from: estimate.max_cost
+            as: opus_first_expected_max_cost
+
+      - id: second_messages_call_reads_cache
+        request:
+          method: POST
+          path: /v1/messages
+          headers:
+            Authorization: Bearer ${opus_key}
+            anthropic-version: "2023-06-01"
+          json:
+            model: claude-opus-4-8
+            max_tokens: 64
+            messages:
+              - role: user
+                content:
+                  - type: text
+                    text: ${cacheable_document}
+                    cache_control:
+                      type: ephemeral
+                  - type: text
+                    text: Summarize the agreement in one short sentence.
+        expect:
+          status: 200
+          json_exists:
+            - usage.input_tokens
+            - usage.output_tokens
+            - usage.cache_creation_input_tokens
+            - usage.cache_read_input_tokens
+          json_equals:
+            usage.cache_creation_input_tokens: 0
+          json_number_gte:
+            usage.cache_read_input_tokens: 1
+        save:
+          - from: json.usage.input_tokens
+            as: opus_second_input_tokens
+          - from: json.usage.output_tokens
+            as: opus_second_output_tokens
+          - from: json.usage.cache_creation_input_tokens
+            as: opus_second_cache_creation_input_tokens
+          - from: json.usage.cache_read_input_tokens
+            as: opus_second_cache_read_input_tokens
+
+      - id: estimate_second_opus_cost
+        cost_estimate:
+          usage:
+            input_text_tokens: ${opus_second_input_tokens}
+            output_text_tokens: ${opus_second_output_tokens}
+            cache_creation_input_tokens: ${opus_second_cache_creation_input_tokens}
+            cache_read_input_tokens: ${opus_second_cache_read_input_tokens}
+          pricing:
+            input_cost_per_token: ${opus_input_cost_per_token}
+            output_cost_per_token: ${opus_output_cost_per_token}
+            cache_creation_input_token_cost: ${opus_cache_creation_input_token_cost}
+            cache_read_input_token_cost: ${opus_cache_read_input_token_cost}
+          tolerance:
+            absolute: 0.000001
+            percent: 0.01
+        save:
+          - from: estimate.min_cost
+            as: opus_second_expected_min_cost
+          - from: estimate.max_cost
+            as: opus_second_expected_max_cost
+
+      - id: wait_for_opus_spend_logs
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${opus_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+          poll:
+            timeout_seconds: 45
+            interval_seconds: 3
+            success:
+              json_path: data[1].model_group
+              values:
+                - claude-opus-4-8
+        expect:
+          status: 200
+
+      - id: fetch_opus_spend_logs
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${opus_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_exists:
+            - data[0].spend
+            - data[1].spend
+            - data[0].metadata.additional_usage_values.cache_creation_input_tokens
+            - data[0].metadata.additional_usage_values.cache_read_input_tokens
+            - data[1].metadata.additional_usage_values.cache_creation_input_tokens
+            - data[1].metadata.additional_usage_values.cache_read_input_tokens
+          json_equals:
+            data[0].call_type: anthropic_messages
+            data[1].call_type: anthropic_messages
+            data[0].model_group: claude-opus-4-8
+            data[1].model_group: claude-opus-4-8
+            data[0].metadata.additional_usage_values.cache_creation_input_tokens: 0
+            data[1].metadata.additional_usage_values.cache_read_input_tokens: 0
+          json_number_gte:
+            data[0].metadata.additional_usage_values.cache_read_input_tokens: 1
+            data[1].metadata.additional_usage_values.cache_creation_input_tokens: 1
+            data[0].spend: ${opus_second_expected_min_cost}
+            data[1].spend: ${opus_first_expected_min_cost}
+          json_number_lte:
+            data[0].spend: ${opus_second_expected_max_cost}
+            data[1].spend: ${opus_first_expected_max_cost}
+
+    cleanup:
+      - id: delete_claude_opus_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${opus_key}
+        expect:
+          status: 200

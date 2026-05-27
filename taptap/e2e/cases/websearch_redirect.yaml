@@ -1,0 +1,141 @@
+suite_version: 1
+id: websearch_redirect
+patch_id: websearch_redirect_model
+status: active
+description: Verify pure web-search Anthropic Messages requests are routed through the configured redirect model.
+
+variables:
+  websearch_key_alias: taptap-e2e-websearch-redirect-${run_id}
+  websearch_source_model: claude-sonnet-5
+  websearch_redirect_model: claude-haiku-4-5-20251001
+
+shared:
+  timeout_seconds: 90
+  headers:
+    Content-Type: application/json
+
+scenarios:
+  - id: claude_sonnet_websearch_redirects_to_haiku
+    description: claude-sonnet-5 pure web-search requests should be billed against the configured Haiku redirect model.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_websearch_redirect_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            key_alias: ${websearch_key_alias}
+            models:
+              - ${websearch_source_model}
+              - ${websearch_redirect_model}
+        expect:
+          status: 200
+          json_exists:
+            - key
+        save:
+          - from: json.key
+            as: websearch_key
+          - from: json.token
+            as: websearch_key_hash
+
+      - id: websearch_key_can_see_source_model
+        request:
+          method: GET
+          path: /models
+          headers:
+            Authorization: Bearer ${websearch_key}
+        expect:
+          status: 200
+          body_contains:
+            - ${websearch_source_model}
+
+      - id: claude_sonnet_websearch_call
+        request:
+          method: POST
+          path: /v1/messages
+          headers:
+            Authorization: Bearer ${websearch_key}
+            anthropic-version: "2023-06-01"
+          json:
+            model: ${websearch_source_model}
+            max_tokens: 96
+            tools:
+              - type: web_search_20250305
+                name: web_search
+                max_uses: 1
+            messages:
+              - role: user
+                content: Use web search exactly once to find the current OpenAI homepage title. Reply in one short sentence.
+        expect:
+          status: 200
+          json_exists:
+            - id
+            - usage.input_tokens
+            - usage.output_tokens
+            - usage.server_tool_use.web_search_requests
+          json_number_gte:
+            usage.server_tool_use.web_search_requests: 1
+
+      - id: wait_for_websearch_redirect_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${websearch_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+          poll:
+            timeout_seconds: 45
+            interval_seconds: 3
+            success:
+              json_path: data[0].model_group
+              values:
+                - ${websearch_redirect_model}
+        expect:
+          status: 200
+
+      - id: fetch_websearch_redirect_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${websearch_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            data[0].call_type: anthropic_messages
+            data[0].model_group: ${websearch_redirect_model}
+          json_contains:
+            data[0].model: claude-haiku-4-5
+          json_exists:
+            - data[0].spend
+          json_number_gte:
+            total: 1
+            data[0].spend: 0.000001
+
+    cleanup:
+      - id: delete_websearch_redirect_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${websearch_key}
+        expect:
+          status: 200

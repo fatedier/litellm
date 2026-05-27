@@ -1,0 +1,166 @@
+suite_version: 1
+id: nova_cost_discount
+patch_id: nova_cost_discount
+status: active
+description: Verify gpt-5.4 deployments with nova_cost_discount record discounted spend correctly.
+
+variables:
+  nova_discount_model: gpt-5.4
+  nova_discount_key_alias: taptap-e2e-nova-discount-${run_id}
+
+shared:
+  timeout_seconds: 90
+  headers:
+    Content-Type: application/json
+
+scenarios:
+  - id: gpt_5_4_discounted_chat_billing
+    description: gpt-5.4 should use the configured nova_cost_discount and persist discount breakdown fields in spend logs.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: discover_gpt54_nova_cost_discount
+        nova_discount_discovery:
+          model_name: ${nova_discount_model}
+          master_key: ${TAPTAP_E2E_MASTER_KEY}
+        save:
+          - from: value.nova_cost_discount
+            as: nova_cost_discount
+
+      - id: create_nova_discount_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            key_alias: ${nova_discount_key_alias}
+            models:
+              - ${nova_discount_model}
+        expect:
+          status: 200
+          json_exists:
+            - key
+        save:
+          - from: json.key
+            as: nova_discount_key
+          - from: json.token
+            as: nova_discount_key_hash
+
+      - id: nova_discount_key_can_see_model
+        request:
+          method: GET
+          path: /models
+          headers:
+            Authorization: Bearer ${nova_discount_key}
+        expect:
+          status: 200
+          body_contains:
+            - ${nova_discount_model}
+
+      - id: gpt54_discounted_chat_call
+        request:
+          method: POST
+          path: /v1/chat/completions
+          headers:
+            Authorization: Bearer ${nova_discount_key}
+          json:
+            model: ${nova_discount_model}
+            max_completion_tokens: 32
+            messages:
+              - role: user
+                content: "Reply with exactly: pong"
+        expect:
+          status: 200
+          json_equals:
+            model: ${nova_discount_model}
+          json_exists:
+            - usage.prompt_tokens
+            - usage.completion_tokens
+            - usage.total_tokens
+          json_number_gte:
+            usage.prompt_tokens: 1
+            usage.completion_tokens: 1
+
+      - id: wait_for_nova_discount_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${nova_discount_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+          poll:
+            timeout_seconds: 45
+            interval_seconds: 3
+            success:
+              json_path: data[0].model_group
+              values:
+                - ${nova_discount_model}
+        expect:
+          status: 200
+
+      - id: fetch_nova_discount_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${nova_discount_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            data[0].call_type: acompletion
+            data[0].model_group: ${nova_discount_model}
+            data[0].status: success
+          json_exists:
+            - data[0].metadata.cost_breakdown.original_cost
+            - data[0].metadata.cost_breakdown.discount_amount
+            - data[0].metadata.cost_breakdown.total_cost
+          json_number_gte:
+            data[0].metadata.cost_breakdown.original_cost: 0.000000001
+            data[0].metadata.cost_breakdown.discount_amount: 0.000000001
+            data[0].metadata.cost_breakdown.total_cost: 0.000000001
+        save:
+          - from: json.data[0].metadata.cost_breakdown.discount_percent
+            as: nova_discount_actual_percent
+          - from: json.data[0].metadata.cost_breakdown.discount_amount
+            as: nova_discount_amount
+          - from: json.data[0].metadata.cost_breakdown.original_cost
+            as: nova_discount_original_cost
+          - from: json.data[0].metadata.cost_breakdown.total_cost
+            as: nova_discount_total_cost
+
+      - id: assert_nova_discount_cost_breakdown
+        cost_discount_assertion:
+          expected_discount_percent: ${nova_cost_discount}
+          discount_percent: ${nova_discount_actual_percent}
+          discount_amount: ${nova_discount_amount}
+          original_cost: ${nova_discount_original_cost}
+          total_cost: ${nova_discount_total_cost}
+          tolerance:
+            absolute: 0.000001
+            percent: 0.01
+
+    cleanup:
+      - id: delete_nova_discount_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${nova_discount_key}
+        expect:
+          status: 200

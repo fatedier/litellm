@@ -1,0 +1,468 @@
+suite_version: 1
+id: router_mock_local
+patch_id: router_retry_and_forward_headers
+status: local
+description: Local-only mock-provider checks for router retries, failure spend attribution, and forwarded client headers.
+
+variables:
+  failover_model: taptap-local-router-failover-${run_id}
+  failure_model: taptap-local-responses-failure-${run_id}
+  headers_model: taptap-local-forward-headers-${run_id}
+  failover_key_alias: taptap-e2e-router-failover-${run_id}
+  failure_key_alias: taptap-e2e-responses-failure-${run_id}
+  headers_key_alias: taptap-e2e-forward-headers-${run_id}
+  mock_a_url: ${TAPTAP_E2E_MOCK_PROVIDER_A_URL}
+  mock_b_url: ${TAPTAP_E2E_MOCK_PROVIDER_B_URL}
+  mock_a_api_base: ${TAPTAP_E2E_MOCK_PROVIDER_A_API_BASE}
+  mock_b_api_base: ${TAPTAP_E2E_MOCK_PROVIDER_B_API_BASE}
+
+shared:
+  timeout_seconds: 30
+  headers:
+    Content-Type: application/json
+
+scenarios:
+  - id: retry_failover_excludes_failed_deployment
+    description: With enable_retry_deployment_failover enabled, a retry should avoid the deployment that just failed.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+      - TAPTAP_E2E_MOCK_PROVIDER_A_URL
+      - TAPTAP_E2E_MOCK_PROVIDER_B_URL
+      - TAPTAP_E2E_MOCK_PROVIDER_A_API_BASE
+      - TAPTAP_E2E_MOCK_PROVIDER_B_API_BASE
+      - TAPTAP_E2E_ENABLE_RETRY_DEPLOYMENT_FAILOVER
+    steps:
+      - id: verify_retry_failover_enabled
+        request:
+          method: GET
+          path: /get/config/callbacks
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+        expect:
+          status: 200
+          json_number_gte:
+            router_settings.num_retries: 1
+          json_equals:
+            router_settings.enable_retry_deployment_failover: true
+
+      - id: reset_failover_mock_a
+        request:
+          method: POST
+          url: ${mock_a_url}/reset
+        expect:
+          status: 200
+          json_equals:
+            count: 0
+
+      - id: reset_failover_mock_b
+        request:
+          method: POST
+          url: ${mock_b_url}/reset
+        expect:
+          status: 200
+          json_equals:
+            count: 0
+
+      - id: add_failing_failover_deployment
+        request:
+          method: POST
+          path: /model/new
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            model_name: ${failover_model}
+            litellm_params:
+              model: openai/${failover_model}-a
+              api_key: test-key
+              api_base: ${mock_a_api_base}
+              cooldown_time: 0
+              order: 1
+            model_info:
+              mode: responses
+        expect:
+          status: 200
+          json_exists:
+            - model_info.id
+        save:
+          - from: json.model_info.id
+            as: failing_failover_model_id
+
+      - id: add_success_failover_deployment
+        request:
+          method: POST
+          path: /model/new
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            model_name: ${failover_model}
+            litellm_params:
+              model: openai/${failover_model}-b
+              api_key: test-key
+              api_base: ${mock_b_api_base}
+              cooldown_time: 0
+              order: 2
+            model_info:
+              mode: responses
+        expect:
+          status: 200
+          json_exists:
+            - model_info.id
+        save:
+          - from: json.model_info.id
+            as: success_failover_model_id
+
+      - id: create_failover_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            key_alias: ${failover_key_alias}
+            models:
+              - ${failover_model}
+        expect:
+          status: 200
+          json_exists:
+            - key
+        save:
+          - from: json.key
+            as: failover_key
+
+      - id: call_failover_responses
+        request:
+          method: POST
+          path: /v1/responses
+          headers:
+            Authorization: Bearer ${failover_key}
+          json:
+            model: ${failover_model}
+            input: taptap router failover local e2e
+        expect:
+          status: 200
+          json_equals:
+            status: completed
+
+      - id: fetch_failing_provider_events
+        request:
+          method: GET
+          url: ${mock_a_url}/events
+        expect:
+          status: 200
+          json_number_gte:
+            count: 1
+          json_contains:
+            events[0].model: ${failover_model}-a
+
+      - id: fetch_success_provider_events
+        request:
+          method: GET
+          url: ${mock_b_url}/events
+        expect:
+          status: 200
+          json_number_gte:
+            count: 1
+          json_contains:
+            events[0].model: ${failover_model}-b
+
+    cleanup:
+      - id: delete_failover_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${failover_key}
+        expect:
+          status: 200
+
+      - id: delete_failing_failover_deployment
+        request:
+          method: POST
+          path: /model/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            id: ${failing_failover_model_id}
+        expect:
+          status: 200
+
+      - id: delete_success_failover_deployment
+        request:
+          method: POST
+          path: /model/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            id: ${success_failover_model_id}
+        expect:
+          status: 200
+
+  - id: responses_retries_and_failure_spend_are_attributed
+    description: A failing Responses deployment should write one attributed failure spend log with retry metadata.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+      - TAPTAP_E2E_MOCK_PROVIDER_A_URL
+      - TAPTAP_E2E_MOCK_PROVIDER_A_API_BASE
+    steps:
+      - id: reset_failure_mock
+        request:
+          method: POST
+          url: ${mock_a_url}/reset
+        expect:
+          status: 200
+          json_equals:
+            count: 0
+
+      - id: add_failure_deployment
+        request:
+          method: POST
+          path: /model/new
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            model_name: ${failure_model}
+            litellm_params:
+              model: openai/${failure_model}-upstream
+              api_key: test-key
+              api_base: ${mock_a_api_base}
+              num_retries: 2
+              cooldown_time: 0
+            model_info:
+              mode: responses
+              disable_background_health_check: true
+        expect:
+          status: 200
+          json_exists:
+            - model_info.id
+        save:
+          - from: json.model_info.id
+            as: failure_model_id
+
+      - id: create_failure_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            key_alias: ${failure_key_alias}
+            models:
+              - ${failure_model}
+        expect:
+          status: 200
+          json_exists:
+            - key
+            - token
+        save:
+          - from: json.key
+            as: failure_key
+          - from: json.token
+            as: failure_key_hash
+
+      - id: call_failing_responses_deployment
+        request:
+          method: POST
+          path: /v1/responses
+          headers:
+            Authorization: Bearer ${failure_key}
+            X-LiteLLM-Call-ID: taptap-responses-failure-${run_id}
+          json:
+            model: ${failure_model}
+            input: taptap responses failure spend local e2e
+        expect:
+          status: 503
+
+      - id: wait_for_failure_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${failure_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+          poll:
+            timeout_seconds: 45
+            interval_seconds: 3
+            success:
+              json_path: data[0].status
+              values:
+                - failure
+        expect:
+          status: 200
+
+      - id: verify_failure_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${failure_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            total: 1
+            data[0].status: failure
+            data[0].call_type: aresponses
+            data[0].model_group: ${failure_model}
+            data[0].metadata.status: failure
+            data[0].metadata.attempted_retries: 2
+            data[0].metadata.max_retries: 2
+          json_exists:
+            - data[0].metadata.error_information
+
+    cleanup:
+      - id: delete_failure_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${failure_key}
+        expect:
+          status: 200
+
+      - id: delete_failure_deployment
+        request:
+          method: POST
+          path: /model/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            id: ${failure_model_id}
+        expect:
+          status: 200
+
+  - id: forward_client_headers_merges_with_static_headers
+    description: A deployment should forward only allowlisted client headers while preserving configured extra_headers.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+      - TAPTAP_E2E_MOCK_PROVIDER_B_URL
+      - TAPTAP_E2E_MOCK_PROVIDER_B_API_BASE
+    steps:
+      - id: reset_header_mock
+        request:
+          method: POST
+          url: ${mock_b_url}/reset
+        expect:
+          status: 200
+          json_equals:
+            count: 0
+
+      - id: add_forward_headers_deployment
+        request:
+          method: POST
+          path: /model/new
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            model_name: ${headers_model}
+            litellm_params:
+              model: openai/${headers_model}-upstream
+              api_key: test-key
+              api_base: ${mock_b_api_base}
+              extra_headers:
+                X-Provider-Required: keep-me
+              forward_client_headers:
+                - user-agent
+                - x-client-version
+            model_info:
+              mode: responses
+        expect:
+          status: 200
+          json_exists:
+            - model_info.id
+        save:
+          - from: json.model_info.id
+            as: forward_headers_model_id
+
+      - id: create_forward_headers_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            key_alias: ${headers_key_alias}
+            models:
+              - ${headers_model}
+        expect:
+          status: 200
+          json_exists:
+            - key
+        save:
+          - from: json.key
+            as: forward_headers_key
+
+      - id: call_forward_headers_responses
+        request:
+          method: POST
+          path: /v1/responses
+          headers:
+            Authorization: Bearer ${forward_headers_key}
+            User-Agent: taptap-e2e-client/1.0
+            X-Client-Version: "2026.07"
+            X-Not-Allowlisted: should-not-forward
+          json:
+            model: ${headers_model}
+            input: taptap forwarded headers local e2e
+        expect:
+          status: 200
+          json_equals:
+            status: completed
+
+      - id: fetch_forward_headers_events
+        request:
+          method: GET
+          url: ${mock_b_url}/events
+        expect:
+          status: 200
+          json_number_gte:
+            count: 1
+          json_equals:
+            events[0].user_agent: taptap-e2e-client/1.0
+            events[0].x_client_version: "2026.07"
+            events[0].x_not_allowlisted: ""
+            events[0].x_provider_required: keep-me
+          json_contains:
+            events[0].model: ${headers_model}-upstream
+
+    cleanup:
+      - id: delete_forward_headers_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${forward_headers_key}
+        expect:
+          status: 200
+
+      - id: delete_forward_headers_deployment
+        request:
+          method: POST
+          path: /model/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            id: ${forward_headers_model_id}
+        expect:
+          status: 200

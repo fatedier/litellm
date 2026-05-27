@@ -1,0 +1,310 @@
+suite_version: 1
+id: openai_embedding_models
+patch_id: openai_embedding_models
+status: active
+description: Verify standard /v1/embeddings compatibility and billing for configured OpenAI embedding models.
+
+variables:
+  openai_embedding_key_alias: taptap-e2e-embed-openai-${run_id}
+  embedding_input_text: hello world from taptap e2e embedding test
+  openai_embedding_large_key_alias: taptap-e2e-embed-openai-large-${run_id}
+
+shared:
+  timeout_seconds: 60
+  headers:
+    Content-Type: application/json
+
+scenarios:
+  - id: text_embedding_3_small_embedding_and_billing
+    description: text-embedding-3-small should work via standard /v1/embeddings and record correct spend.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_text_embedding_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            key_alias: ${openai_embedding_key_alias}
+            models:
+              - text-embedding-3-small
+        expect:
+          status: 200
+          json_exists:
+            - key
+        save:
+          - from: json.key
+            as: text_embedding_key
+          - from: json.token
+            as: text_embedding_key_hash
+
+      - id: text_embedding_public_cost_map_entry
+        request:
+          method: GET
+          path: /public/litellm_model_cost_map
+        expect:
+          status: 200
+          json_equals:
+            text-embedding-3-small.litellm_provider: openai
+            text-embedding-3-small.mode: embedding
+        save:
+          - from: json.text-embedding-3-small.input_cost_per_token
+            as: text_embedding_input_cost_per_token
+
+      - id: text_embedding_key_can_see_model
+        request:
+          method: GET
+          path: /models
+          headers:
+            Authorization: Bearer ${text_embedding_key}
+        expect:
+          status: 200
+          body_contains:
+            - text-embedding-3-small
+
+      - id: text_embedding_request
+        request:
+          method: POST
+          path: /v1/embeddings
+          headers:
+            Authorization: Bearer ${text_embedding_key}
+          json:
+            model: text-embedding-3-small
+            input: ${embedding_input_text}
+        expect:
+          status: 200
+          json_exists:
+            - data[0].embedding[0]
+            - usage.prompt_tokens
+            - usage.total_tokens
+          json_equals:
+            model: text-embedding-3-small
+        save:
+          - from: json.usage.prompt_tokens
+            as: text_embedding_prompt_tokens
+
+      - id: estimate_text_embedding_cost
+        cost_estimate:
+          usage:
+            input_text_tokens: ${text_embedding_prompt_tokens}
+          pricing:
+            input_cost_per_token: ${text_embedding_input_cost_per_token}
+            output_cost_per_token: 0
+          tolerance:
+            absolute: 0.000001
+            percent: 0.01
+        save:
+          - from: estimate.min_cost
+            as: text_embedding_expected_min_cost
+          - from: estimate.max_cost
+            as: text_embedding_expected_max_cost
+
+      - id: wait_for_text_embedding_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${text_embedding_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+          poll:
+            timeout_seconds: 30
+            interval_seconds: 3
+            success:
+              json_path: data[0].model_group
+              values:
+                - text-embedding-3-small
+        expect:
+          status: 200
+
+      - id: fetch_text_embedding_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${text_embedding_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            data[0].call_type: aembedding
+            data[0].model_group: text-embedding-3-small
+            data[0].custom_llm_provider: openai
+          json_exists:
+            - data[0].spend
+          json_number_gte:
+            data[0].spend: ${text_embedding_expected_min_cost}
+          json_number_lte:
+            data[0].spend: ${text_embedding_expected_max_cost}
+
+    cleanup:
+      - id: delete_text_embedding_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${text_embedding_key}
+        expect:
+          status: 200
+
+  - id: text_embedding_3_large_embedding_and_billing
+    description: text-embedding-3-large should work via standard /v1/embeddings and record correct spend.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_text_embedding_large_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            key_alias: ${openai_embedding_large_key_alias}
+            models:
+              - text-embedding-3-large
+        expect:
+          status: 200
+          json_exists:
+            - key
+        save:
+          - from: json.key
+            as: text_embedding_large_key
+          - from: json.token
+            as: text_embedding_large_key_hash
+
+      - id: text_embedding_large_public_cost_map_entry
+        request:
+          method: GET
+          path: /public/litellm_model_cost_map
+        expect:
+          status: 200
+          json_equals:
+            text-embedding-3-large.litellm_provider: openai
+            text-embedding-3-large.mode: embedding
+        save:
+          - from: json.text-embedding-3-large.input_cost_per_token
+            as: text_embedding_large_input_cost_per_token
+
+      - id: text_embedding_large_key_can_see_model
+        request:
+          method: GET
+          path: /models
+          headers:
+            Authorization: Bearer ${text_embedding_large_key}
+        expect:
+          status: 200
+          body_contains:
+            - text-embedding-3-large
+
+      - id: text_embedding_large_request
+        request:
+          method: POST
+          path: /v1/embeddings
+          headers:
+            Authorization: Bearer ${text_embedding_large_key}
+          json:
+            model: text-embedding-3-large
+            input: ${embedding_input_text}
+        expect:
+          status: 200
+          json_exists:
+            - data[0].embedding[0]
+            - usage.prompt_tokens
+            - usage.total_tokens
+          json_equals:
+            model: text-embedding-3-large
+        save:
+          - from: json.usage.prompt_tokens
+            as: text_embedding_large_prompt_tokens
+
+      - id: estimate_text_embedding_large_cost
+        cost_estimate:
+          usage:
+            input_text_tokens: ${text_embedding_large_prompt_tokens}
+          pricing:
+            input_cost_per_token: ${text_embedding_large_input_cost_per_token}
+            output_cost_per_token: 0
+          tolerance:
+            absolute: 0.000001
+            percent: 0.01
+        save:
+          - from: estimate.min_cost
+            as: text_embedding_large_expected_min_cost
+          - from: estimate.max_cost
+            as: text_embedding_large_expected_max_cost
+
+      - id: wait_for_text_embedding_large_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${text_embedding_large_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+          poll:
+            timeout_seconds: 30
+            interval_seconds: 3
+            success:
+              json_path: data[0].model_group
+              values:
+                - text-embedding-3-large
+        expect:
+          status: 200
+
+      - id: fetch_text_embedding_large_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${text_embedding_large_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            data[0].call_type: aembedding
+            data[0].model_group: text-embedding-3-large
+            data[0].custom_llm_provider: openai
+          json_exists:
+            - data[0].spend
+          json_number_gte:
+            data[0].spend: ${text_embedding_large_expected_min_cost}
+          json_number_lte:
+            data[0].spend: ${text_embedding_large_expected_max_cost}
+
+    cleanup:
+      - id: delete_text_embedding_large_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${text_embedding_large_key}
+        expect:
+          status: 200

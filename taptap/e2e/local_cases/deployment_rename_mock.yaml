@@ -1,0 +1,154 @@
+suite_version: 1
+id: deployment_rename_mock_local
+patch_id: deployment_rename_router_sync
+status: local
+description: Local-only mock-provider check for deployment rename synchronization.
+
+variables:
+  old_model: local-deployment-rename-old-${run_id}
+  new_model: local-deployment-rename-new-${run_id}
+  upstream_model: local-deployment-rename-upstream-${run_id}
+  mock_url: ${TAPTAP_E2E_MOCK_PROVIDER_B_URL}
+  mock_api_base: ${TAPTAP_E2E_MOCK_PROVIDER_B_API_BASE}
+
+shared:
+  timeout_seconds: 30
+  headers:
+    Content-Type: application/json
+
+scenarios:
+  - id: renamed_deployment_replaces_old_route
+    description: A DB-synchronized deployment rename should enable the new route and remove the old route.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+      - TAPTAP_E2E_MOCK_PROVIDER_B_URL
+      - TAPTAP_E2E_MOCK_PROVIDER_B_API_BASE
+    steps:
+      - id: reset_mock
+        request:
+          method: POST
+          url: ${mock_url}/reset
+        expect:
+          status: 200
+          json_equals:
+            count: 0
+
+      - id: add_deployment
+        request:
+          method: POST
+          path: /model/new
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            model_name: ${old_model}
+            litellm_params:
+              model: openai/${upstream_model}
+              api_key: test-key
+              api_base: ${mock_api_base}
+            model_info:
+              mode: responses
+        expect:
+          status: 200
+          json_exists:
+            - model_info.id
+        save:
+          - from: json.model_info.id
+            as: deployment_id
+
+      - id: call_old_route_before_rename
+        request:
+          method: POST
+          path: /v1/responses
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            model: ${old_model}
+            input: local deployment rename before update
+        expect:
+          status: 200
+          json_equals:
+            status: completed
+          header_equals:
+            x-litellm-model-id: ${deployment_id}
+
+      - id: rename_deployment_in_db
+        request:
+          method: PATCH
+          path: /internal/v1/model-deployments/${deployment_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            model_name: ${new_model}
+        expect:
+          status: 200
+          json_equals:
+            model_id: ${deployment_id}
+
+      - id: verify_rename_persisted
+        request:
+          method: GET
+          path: /internal/v1/model-deployments/${deployment_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+        expect:
+          status: 200
+          json_equals:
+            model_id: ${deployment_id}
+            model_name: ${new_model}
+
+      - id: wait_for_router_db_sync
+        wait:
+          seconds: 35
+
+      - id: call_new_route_after_rename
+        request:
+          method: POST
+          path: /v1/responses
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            model: ${new_model}
+            input: local deployment rename after update
+        expect:
+          status: 200
+          json_equals:
+            status: completed
+          header_equals:
+            x-litellm-model-id: ${deployment_id}
+
+      - id: reject_old_route_after_rename
+        request:
+          method: POST
+          path: /v1/responses
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            model: ${old_model}
+            input: local deployment rename old route must fail
+        expect:
+          status: 400
+
+      - id: verify_mock_events
+        request:
+          method: GET
+          url: ${mock_url}/events
+        expect:
+          status: 200
+          json_equals:
+            count: 2
+          json_contains:
+            events[0].model: ${upstream_model}
+            events[1].model: ${upstream_model}
+
+    cleanup:
+      - id: delete_deployment
+        request:
+          method: POST
+          path: /model/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            id: ${deployment_id}
+        expect:
+          status: 200

@@ -1,0 +1,206 @@
+suite_version: 1
+id: gpt_5_5_messages_stream
+patch_id: gpt_5_5_messages_stream_billing
+status: active
+description: Verify gpt-5.5 streams through /v1/messages and records correct spend.
+
+variables:
+  gpt55_messages_key_alias: taptap-e2e-gpt-55-messages-${run_id}
+  gpt55_messages_model: gpt-5.5
+
+shared:
+  timeout_seconds: 90
+  headers:
+    Content-Type: application/json
+
+scenarios:
+  - id: gpt_5_5_messages_stream_and_billing
+    description: gpt-5.5 should stream through /v1/messages and bill from recorded prompt and completion tokens.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_gpt55_messages_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            key_alias: ${gpt55_messages_key_alias}
+            models:
+              - ${gpt55_messages_model}
+        expect:
+          status: 200
+          json_exists:
+            - key
+        save:
+          - from: json.key
+            as: gpt55_messages_key
+          - from: json.token
+            as: gpt55_messages_key_hash
+
+      - id: model_group_info_has_gpt55_pricing
+        request:
+          method: GET
+          path: /model_group/info
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            model_group: ${gpt55_messages_model}
+        expect:
+          status: 200
+          json_equals:
+            data[0].model_group: ${gpt55_messages_model}
+            data[0].mode: chat
+          json_number_gte:
+            data[0].input_cost_per_token: 0.000000001
+            data[0].output_cost_per_token: 0.000000001
+        save:
+          - from: json.data[0].input_cost_per_token
+            as: gpt55_messages_input_cost_per_token
+          - from: json.data[0].output_cost_per_token
+            as: gpt55_messages_output_cost_per_token
+
+      - id: gpt55_messages_key_can_see_model
+        request:
+          method: GET
+          path: /models
+          headers:
+            Authorization: Bearer ${gpt55_messages_key}
+        expect:
+          status: 200
+          body_contains:
+            - ${gpt55_messages_model}
+
+      - id: gpt55_messages_stream_call
+        request:
+          method: POST
+          path: /v1/messages
+          headers:
+            Authorization: Bearer ${gpt55_messages_key}
+            anthropic-version: "2023-06-01"
+          json:
+            model: ${gpt55_messages_model}
+            max_tokens: 32
+            service_tier: default
+            stream: true
+            messages:
+              - role: user
+                content:
+                  - type: text
+                    text: "Reply with exactly: pong"
+        expect:
+          status: 200
+          header_exists:
+            - content-type
+          body_contains:
+            - "event: message_start"
+            - "event: content_block_delta"
+            - "event: message_stop"
+            - "\"model\": \"gpt-5.5\""
+
+      - id: wait_for_gpt55_messages_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${gpt55_messages_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+          poll:
+            timeout_seconds: 45
+            interval_seconds: 3
+            success:
+              json_path: data[0].model_group
+              values:
+                - ${gpt55_messages_model}
+        expect:
+          status: 200
+
+      - id: fetch_gpt55_messages_spend_tokens
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${gpt55_messages_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            data[0].call_type: anthropic_messages
+            data[0].model_group: ${gpt55_messages_model}
+            data[0].status: success
+          json_number_gte:
+            data[0].prompt_tokens: 1
+            data[0].completion_tokens: 1
+            data[0].spend: 0.000000001
+        save:
+          - from: json.data[0].prompt_tokens
+            as: gpt55_messages_prompt_tokens
+          - from: json.data[0].completion_tokens
+            as: gpt55_messages_completion_tokens
+
+      - id: estimate_gpt55_messages_cost
+        cost_estimate:
+          usage:
+            input_text_tokens: ${gpt55_messages_prompt_tokens}
+            output_text_tokens: ${gpt55_messages_completion_tokens}
+          pricing:
+            input_cost_per_token: ${gpt55_messages_input_cost_per_token}
+            output_cost_per_token: ${gpt55_messages_output_cost_per_token}
+          tolerance:
+            absolute: 0.000001
+            percent: 0.01
+        save:
+          - from: estimate.min_cost
+            as: gpt55_messages_expected_min_cost
+          - from: estimate.max_cost
+            as: gpt55_messages_expected_max_cost
+
+      - id: fetch_gpt55_messages_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${gpt55_messages_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            data[0].call_type: anthropic_messages
+            data[0].model_group: ${gpt55_messages_model}
+            data[0].status: success
+          json_exists:
+            - data[0].spend
+          json_number_gte:
+            data[0].spend: ${gpt55_messages_expected_min_cost}
+          json_number_lte:
+            data[0].spend: ${gpt55_messages_expected_max_cost}
+
+    cleanup:
+      - id: delete_gpt55_messages_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${gpt55_messages_key}
+        expect:
+          status: 200

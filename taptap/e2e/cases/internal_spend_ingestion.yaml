@@ -1,0 +1,184 @@
+suite_version: 1
+id: internal_spend_ingestion
+patch_id: internal_spend_ingestion
+status: active
+description: Verify internal spend ingestion accepts realtime spend and records a queryable spend log.
+
+variables:
+  spend_ingestion_key_alias: taptap-e2e-spend-ingestion-${run_id}
+  spend_ingestion_request_id: taptap-e2e-spend-ingestion-${run_id}
+  spend_ingestion_session_id: taptap-e2e-spend-ingestion-session-${run_id}
+  spend_ingestion_end_user_id: taptap-e2e-spend-ingestion-end-user-${run_id}
+  spend_ingestion_model: gpt-realtime-mini
+  spend_ingestion_log_start_date: "2026-06-09 00:00:00"
+  spend_ingestion_log_end_date: "2026-06-09 23:59:59"
+
+shared:
+  timeout_seconds: 60
+  headers:
+    Content-Type: application/json
+
+scenarios:
+  - id: ingest_realtime_spend_and_query_log
+    description: Internal spend ingestion should be master-key-only and write realtime spend logs with metadata.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_spend_ingestion_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            key_alias: ${spend_ingestion_key_alias}
+            metadata:
+              tags:
+                - taptap-e2e
+                - spend-ingestion
+              spend_logs_metadata:
+                source: e2e
+        expect:
+          status: 200
+          json_exists:
+            - key
+            - token
+        save:
+          - from: json.key
+            as: spend_ingestion_key
+          - from: json.token
+            as: spend_ingestion_key_hash
+
+      - id: reject_non_master_spend_ingestion
+        request:
+          method: POST
+          path: /internal/spend/ingest
+          headers:
+            Authorization: Bearer ${spend_ingestion_key}
+          json:
+            request_id: ${spend_ingestion_request_id}-rejected
+            api_key_hash: ${spend_ingestion_key_hash}
+            call_type: _arealtime
+            model: ${spend_ingestion_model}
+            spend: 0.000123
+            start_time: "2026-06-09T01:02:03Z"
+            end_time: "2026-06-09T01:02:05Z"
+            session_id: ${spend_ingestion_session_id}
+            usage:
+              prompt_tokens: 11
+              completion_tokens: 13
+              total_tokens: 24
+              input_seconds: 1.25
+              output_seconds: 0.75
+        expect:
+          status: 401
+          body_contains:
+            - Invalid LiteLLM master key
+
+      - id: ingest_realtime_spend
+        request:
+          method: POST
+          path: /internal/spend/ingest
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            request_id: ${spend_ingestion_request_id}
+            api_key_hash: ${spend_ingestion_key_hash}
+            call_type: _arealtime
+            model: ${spend_ingestion_model}
+            spend: 0.000123
+            start_time: "2026-06-09T01:02:03Z"
+            end_time: "2026-06-09T01:02:05Z"
+            session_id: ${spend_ingestion_session_id}
+            usage:
+              prompt_tokens: 11
+              completion_tokens: 13
+              total_tokens: 24
+              input_seconds: 1.25
+              output_seconds: 0.75
+            metadata:
+              user_api_key_end_user_id: ${spend_ingestion_end_user_id}
+              spend_logs_metadata:
+                ingestion_case: payload
+        expect:
+          status: 200
+          json_equals:
+            status: accepted
+            request_id: ${spend_ingestion_request_id}
+            call_type: _arealtime
+
+      - id: wait_for_spend_ingestion_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            request_id: ${spend_ingestion_request_id}
+            start_date: ${spend_ingestion_log_start_date}
+            end_date: ${spend_ingestion_log_end_date}
+            page: 1
+            page_size: 5
+          poll:
+            timeout_seconds: 45
+            interval_seconds: 3
+            success:
+              json_path: data[0].request_id
+              values:
+                - ${spend_ingestion_request_id}
+        expect:
+          status: 200
+
+      - id: fetch_spend_ingestion_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            request_id: ${spend_ingestion_request_id}
+            start_date: ${spend_ingestion_log_start_date}
+            end_date: ${spend_ingestion_log_end_date}
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            data[0].request_id: ${spend_ingestion_request_id}
+            data[0].api_key: ${spend_ingestion_key_hash}
+            data[0].call_type: _arealtime
+            data[0].model: ${spend_ingestion_model}
+            data[0].model_group: ${spend_ingestion_model}
+            data[0].prompt_tokens: 11
+            data[0].completion_tokens: 13
+            data[0].total_tokens: 24
+            data[0].metadata.user_api_key_alias: ${spend_ingestion_key_alias}
+            data[0].metadata.spend_logs_metadata.source: e2e
+            data[0].metadata.spend_logs_metadata.ingestion_case: payload
+            data[0].request_tags[0]: taptap-e2e
+            data[0].request_tags[1]: spend-ingestion
+            data[0].session_id: ${spend_ingestion_session_id}
+            data[0].end_user: ${spend_ingestion_end_user_id}
+            data[0].status: success
+          json_number_gte:
+            data[0].spend: 0.000122
+            data[0].metadata.additional_usage_values.input_seconds: 1.25
+            data[0].metadata.additional_usage_values.output_seconds: 0.75
+          json_number_lte:
+            data[0].spend: 0.000124
+            data[0].metadata.additional_usage_values.input_seconds: 1.25
+            data[0].metadata.additional_usage_values.output_seconds: 0.75
+
+    cleanup:
+      - id: delete_spend_ingestion_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${spend_ingestion_key}
+        expect:
+          status: 200

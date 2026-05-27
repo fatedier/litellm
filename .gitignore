@@ -3,6 +3,7 @@
 .venv-typecheck
 .venv_policy_test
 .env
+.env.local
 .claude
 .newenv
 newenv/*

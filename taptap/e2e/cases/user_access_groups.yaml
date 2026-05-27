@@ -1,0 +1,267 @@
+suite_version: 1
+id: user_access_groups
+patch_id: user_access_group_membership
+status: active
+description: Verify user-level access group membership grants models, filters discovery, blocks group deletion while assigned, and revokes access after membership is cleared.
+
+variables:
+  group_name: taptap-e2e-access-group-${run_id}
+  member_user_id: taptap-e2e-ag-member-${run_id}
+  key_alias: taptap-e2e-ag-member-key-${run_id}
+  group_model: gpt-5.5
+  out_of_group_model: claude-sonnet-5
+
+shared:
+  timeout_seconds: 30
+  headers:
+    Content-Type: application/json
+
+scenarios:
+  - id: membership_grants_models_and_protects_group_deletion
+    description: >
+      A user with models=[no-default-models] and an access group membership can
+      see and call only the group's models through a plain personal key. The
+      group cannot be deleted while assigned, and clearing the membership
+      revokes access within the user cache TTL.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_access_group
+        request:
+          method: POST
+          path: /v1/access_group
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            access_group_name: ${group_name}
+            access_model_names:
+              - ${group_model}
+        expect:
+          status: 201
+          json_exists:
+            - access_group_id
+        save:
+          - from: json.access_group_id
+            as: access_group_id
+
+      - id: create_member_user
+        request:
+          method: POST
+          path: /user/new
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            user_id: ${member_user_id}
+            user_role: internal_user
+            auto_create_key: false
+            models:
+              - no-default-models
+            access_group_ids:
+              - ${access_group_id}
+        expect:
+          status: 200
+
+      - id: create_member_personal_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            user_id: ${member_user_id}
+            key_alias: ${key_alias}
+        expect:
+          status: 200
+          json_exists:
+            - key
+        save:
+          - from: json.key
+            as: member_key
+
+      - id: member_key_sees_group_model
+        request:
+          method: GET
+          path: /models
+          headers:
+            Authorization: Bearer ${member_key}
+        expect:
+          status: 200
+          body_contains:
+            - ${group_model}
+
+      - id: out_of_group_model_is_denied
+        request:
+          method: POST
+          path: /v1/chat/completions
+          headers:
+            Authorization: Bearer ${member_key}
+          json:
+            model: ${out_of_group_model}
+            messages:
+              - role: user
+                content: access group deny probe
+        expect:
+          status: 403
+          json_equals:
+            error.type: user_model_access_denied
+
+      - id: group_model_call_succeeds
+        request:
+          method: POST
+          path: /v1/chat/completions
+          headers:
+            Authorization: Bearer ${member_key}
+          json:
+            model: ${group_model}
+            messages:
+              - role: user
+                content: access group allow probe, reply with one short word
+        expect:
+          status: 200
+          json_exists:
+            - choices
+
+      - id: user_list_filters_by_access_group
+        request:
+          method: GET
+          path: /user/list
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            access_group_id: ${access_group_id}
+        expect:
+          status: 200
+          body_contains:
+            - ${member_user_id}
+
+      # Memberships live in their own table, so a read that does not load the
+      # relation reports no groups while the filter above still passes. A
+      # control plane has to be able to read back what it wrote, so every user
+      # read contract is asserted, not just the ability to search by group.
+      - id: user_list_returns_access_group_ids
+        request:
+          method: GET
+          path: /user/list
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            user_ids: ${member_user_id}
+        expect:
+          status: 200
+          json_equals:
+            users[0].access_group_ids[0]: ${access_group_id}
+
+      - id: user_info_returns_access_group_ids
+        request:
+          method: GET
+          path: /user/info
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            user_id: ${member_user_id}
+        expect:
+          status: 200
+          json_equals:
+            user_info.access_group_ids[0]: ${access_group_id}
+
+      - id: user_info_v2_returns_access_group_ids
+        request:
+          method: GET
+          path: /v2/user/info
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            user_id: ${member_user_id}
+        expect:
+          status: 200
+          json_equals:
+            access_group_ids[0]: ${access_group_id}
+
+      - id: delete_group_while_assigned_conflicts
+        request:
+          method: DELETE
+          path: /v1/access_group/${access_group_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+        expect:
+          status: 409
+
+      - id: clear_member_access_groups
+        request:
+          method: POST
+          path: /user/update
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            user_id: ${member_user_id}
+            access_group_ids: []
+        expect:
+          status: 200
+
+      - id: revocation_propagates_to_all_workers
+        request:
+          method: POST
+          path: /v1/chat/completions
+          headers:
+            Authorization: Bearer ${member_key}
+          json:
+            model: ${group_model}
+            messages:
+              - role: user
+                content: access group revocation probe, reply with one short word
+          poll:
+            timeout_seconds: 90
+            interval_seconds: 8
+            success:
+              json_path: error.type
+              values:
+                - user_model_access_denied
+                - key_model_access_denied
+        expect:
+          status: 403
+
+      - id: delete_group_after_membership_cleared
+        request:
+          method: DELETE
+          path: /v1/access_group/${access_group_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+        expect:
+          status: 204
+
+    cleanup:
+      - id: delete_member_personal_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${member_key}
+        expect:
+          status: 200
+
+      - id: delete_member_user
+        request:
+          method: POST
+          path: /user/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            user_ids:
+              - ${member_user_id}
+        expect:
+          status: 200
+
+      - id: delete_group_if_left_over
+        request:
+          method: DELETE
+          path: /v1/access_group/${access_group_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+        expect:
+          status_in:
+            - 204
+            - 404

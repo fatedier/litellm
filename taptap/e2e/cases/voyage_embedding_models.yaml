@@ -1,0 +1,173 @@
+suite_version: 1
+id: voyage_embedding_models
+patch_id: voyage_embedding_models
+status: active
+description: Verify standard /v1/embeddings compatibility and billing for configured Voyage embedding models.
+
+variables:
+  voyage_embedding_key_alias: taptap-e2e-embed-voyage-${run_id}
+  embedding_input_text: hello world from taptap e2e embedding test
+
+shared:
+  timeout_seconds: 60
+  headers:
+    Content-Type: application/json
+
+scenarios:
+  - id: voyage_4_large_embedding_and_billing
+    description: voyage/voyage-4-large should work via standard /v1/embeddings and record correct spend.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_voyage_embedding_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            key_alias: ${voyage_embedding_key_alias}
+            models:
+              - voyage/voyage-4-large
+        expect:
+          status: 200
+          json_exists:
+            - key
+        save:
+          - from: json.key
+            as: voyage_embedding_key
+          - from: json.token
+            as: voyage_embedding_key_hash
+
+      - id: voyage_embedding_key_can_see_model
+        request:
+          method: GET
+          path: /models
+          headers:
+            Authorization: Bearer ${voyage_embedding_key}
+        expect:
+          status: 200
+          body_contains:
+            - voyage/voyage-4-large
+
+      - id: voyage_embedding_request
+        request:
+          method: POST
+          path: /v1/embeddings
+          headers:
+            Authorization: Bearer ${voyage_embedding_key}
+          json:
+            model: voyage/voyage-4-large
+            input: ${embedding_input_text}
+        expect:
+          status: 200
+          json_exists:
+            - data[0].embedding[0]
+            - usage.prompt_tokens
+            - usage.total_tokens
+          json_equals:
+            model: voyage/voyage-4-large
+        save:
+          - from: json.usage.prompt_tokens
+            as: voyage_embedding_prompt_tokens
+
+      - id: wait_for_voyage_embedding_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${voyage_embedding_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+          poll:
+            timeout_seconds: 30
+            interval_seconds: 3
+            success:
+              json_path: data[0].model_group
+              values:
+                - voyage/voyage-4-large
+        expect:
+          status: 200
+
+      - id: fetch_voyage_embedding_pricing
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${voyage_embedding_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            data[0].call_type: aembedding
+            data[0].model_group: voyage/voyage-4-large
+            data[0].custom_llm_provider: voyage
+          json_exists:
+            - data[0].metadata.model_map_information.model_map_value.input_cost_per_token
+        save:
+          - from: json.data[0].metadata.model_map_information.model_map_value.input_cost_per_token
+            as: voyage_embedding_input_cost_per_token
+
+      - id: estimate_voyage_embedding_cost
+        cost_estimate:
+          usage:
+            input_text_tokens: ${voyage_embedding_prompt_tokens}
+          pricing:
+            input_cost_per_token: ${voyage_embedding_input_cost_per_token}
+            output_cost_per_token: 0
+          tolerance:
+            absolute: 0.000001
+            percent: 0.01
+        save:
+          - from: estimate.min_cost
+            as: voyage_embedding_expected_min_cost
+          - from: estimate.max_cost
+            as: voyage_embedding_expected_max_cost
+
+      - id: fetch_voyage_embedding_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${voyage_embedding_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            data[0].call_type: aembedding
+            data[0].model_group: voyage/voyage-4-large
+            data[0].custom_llm_provider: voyage
+          json_exists:
+            - data[0].spend
+          json_number_gte:
+            data[0].spend: ${voyage_embedding_expected_min_cost}
+          json_number_lte:
+            data[0].spend: ${voyage_embedding_expected_max_cost}
+
+    cleanup:
+      - id: delete_voyage_embedding_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${voyage_embedding_key}
+        expect:
+          status: 200

@@ -1,0 +1,178 @@
+suite_version: 1
+id: elevenlabs_audio_speech
+patch_id: elevenlabs_audio_speech
+status: active
+description: Verify ElevenLabs eleven_v3 speech generation compatibility and billing.
+
+variables:
+  elevenlabs_key_alias: taptap-e2e-elevenlabs-${run_id}
+  speech_input_text: Hello from TapTap E2E test.
+  speech_input_billable_characters: 23
+
+shared:
+  timeout_seconds: 60
+  headers:
+    Content-Type: application/json
+
+scenarios:
+  - id: eleven_v3_audio_speech_and_billing
+    description: A temporary key should see elevenlabs/eleven_v3, synthesize MP3 audio, and record correct spend.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_elevenlabs_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            key_alias: ${elevenlabs_key_alias}
+            models:
+              - elevenlabs/eleven_v3
+        expect:
+          status: 200
+          json_exists:
+            - key
+        save:
+          - from: json.key
+            as: elevenlabs_key
+          - from: json.token
+            as: elevenlabs_key_hash
+
+      - id: public_model_cost_map_has_elevenlabs_model
+        request:
+          method: GET
+          path: /public/litellm_model_cost_map
+        expect:
+          status: 200
+          json_equals:
+            elevenlabs/eleven_v3.litellm_provider: elevenlabs
+            elevenlabs/eleven_v3.mode: audio_speech
+            elevenlabs/eleven_v3.supported_endpoints[0]: /v1/audio/speech
+        save:
+          - from: json.elevenlabs/eleven_v3.input_cost_per_character
+            as: elevenlabs_input_cost_per_character
+
+      - id: elevenlabs_key_can_see_model
+        request:
+          method: GET
+          path: /models
+          headers:
+            Authorization: Bearer ${elevenlabs_key}
+        expect:
+          status: 200
+          body_contains:
+            - elevenlabs/eleven_v3
+
+      - id: generate_elevenlabs_audio
+        request:
+          method: POST
+          path: /v1/audio/speech
+          headers:
+            Authorization: Bearer ${elevenlabs_key}
+          json:
+            model: elevenlabs/eleven_v3
+            input: ${speech_input_text}
+            voice: alloy
+            response_format: mp3
+          save_body_to: elevenlabs-output.mp3
+        expect:
+          status: 200
+          header_equals:
+            Content-Type: audio/mpeg
+          header_exists:
+            - x-litellm-response-cost
+            - x-litellm-call-id
+        save:
+          - from: file.path
+            as: elevenlabs_audio_path
+          - from: header.x-litellm-response-cost
+            as: elevenlabs_response_cost
+
+      - id: probe_elevenlabs_audio
+        media_probe:
+          path: ${elevenlabs_audio_path}
+        expect:
+          media:
+            duration_seconds_gte: 1.0
+
+      - id: estimate_elevenlabs_cost
+        cost_estimate:
+          usage:
+            input_text_tokens: 0
+            input_characters: ${speech_input_billable_characters}
+          pricing:
+            input_cost_per_token: 0
+            input_cost_per_character: ${elevenlabs_input_cost_per_character}
+            output_cost_per_token: 0
+          tolerance:
+            absolute: 0.000001
+            percent: 0.01
+        save:
+          - from: estimate.min_cost
+            as: elevenlabs_expected_min_cost
+          - from: estimate.max_cost
+            as: elevenlabs_expected_max_cost
+
+      - id: wait_for_elevenlabs_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${elevenlabs_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+          poll:
+            timeout_seconds: 30
+            interval_seconds: 3
+            success:
+              json_path: data[0].model_group
+              values:
+                - elevenlabs/eleven_v3
+        expect:
+          status: 200
+
+      - id: fetch_elevenlabs_spend_logs
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${elevenlabs_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            data[0].call_type: aspeech
+            data[0].model: elevenlabs/eleven_v3
+            data[0].model_group: elevenlabs/eleven_v3
+            data[0].custom_llm_provider: elevenlabs
+          json_exists:
+            - data[0].spend
+          json_number_gte:
+            data[0].spend: ${elevenlabs_expected_min_cost}
+          json_number_lte:
+            data[0].spend: ${elevenlabs_expected_max_cost}
+
+    cleanup:
+      - id: delete_elevenlabs_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${elevenlabs_key}
+        expect:
+          status: 200

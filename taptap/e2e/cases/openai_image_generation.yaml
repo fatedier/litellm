@@ -1,0 +1,303 @@
+suite_version: 1
+id: openai_image_generation
+patch_id: gpt_image_2_support
+status: active
+description: Verify gpt-image-2 transparent image generation, image edits, and non-zero spend billing.
+
+variables:
+  image_key_alias: taptap-e2e-gpt-image-2-${run_id}
+
+shared:
+  timeout_seconds: 60
+
+scenarios:
+  - id: gpt_image_2_generation_edit_and_billing
+    description: A temporary key should generate a transparent PNG, edit that generated image, and record correct spend for both calls.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_gpt_image_2_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            key_alias: ${image_key_alias}
+            models:
+              - gpt-image-2
+        expect:
+          status: 200
+          json_exists:
+            - key
+        save:
+          - from: json.key
+            as: image_key
+          - from: json.token
+            as: image_key_hash
+
+      - id: public_model_cost_map_has_gpt_image_2
+        request:
+          method: GET
+          path: /public/litellm_model_cost_map
+        expect:
+          status: 200
+          json_equals:
+            gpt-image-2.litellm_provider: openai
+            gpt-image-2.mode: image_generation
+          json_contains:
+            gpt-image-2.supported_endpoints: /v1/images/edits
+        save:
+          - from: json.gpt-image-2.input_cost_per_token
+            as: image_input_cost_per_token
+          - from: json.gpt-image-2.input_cost_per_image_token
+            as: image_input_cost_per_image_token
+          - from: json.gpt-image-2.output_cost_per_token
+            as: image_output_cost_per_token
+          - from: json.gpt-image-2.output_cost_per_image_token
+            as: image_output_cost_per_image_token
+
+      - id: image_key_can_see_gpt_image_2
+        request:
+          method: GET
+          path: /models
+          headers:
+            Authorization: Bearer ${image_key}
+        expect:
+          status: 200
+          body_contains:
+            - gpt-image-2
+
+      - id: generate_gpt_image_2_image
+        request:
+          method: POST
+          path: /v1/images/generations
+          headers:
+            Authorization: Bearer ${image_key}
+          json:
+            model: gpt-image-2
+            prompt: A small bright red ball with clean edges.
+            size: 1024x1024
+            background: transparent
+            output_format: png
+        expect:
+          status: 200
+          json_exists:
+            - created
+            - data[0].b64_json
+            - usage.input_tokens
+            - usage.output_tokens
+            - usage.input_tokens_details.text_tokens
+            - usage.output_tokens_details.image_tokens
+          json_contains:
+            data[0].b64_json: iVBOR
+        save:
+          - from: json.data[0].b64_json
+            decode_base64_to: ${artifacts_dir}/gpt-image-2-generated.png
+            as: generated_image_path
+          - from: json.usage.input_tokens_details.text_tokens
+            as: image_input_text_tokens
+          - from: json.usage.input_tokens_details.image_tokens
+            as: image_input_image_tokens
+          - from: json.usage.output_tokens_details.text_tokens
+            as: image_output_text_tokens
+          - from: json.usage.output_tokens_details.image_tokens
+            as: image_output_image_tokens
+
+      - id: verify_gpt_image_2_transparent_background
+        image_probe:
+          path: ${generated_image_path}
+        expect:
+          image:
+            format: png
+            transparent_fraction_gte: 0.05
+
+      - id: estimate_gpt_image_2_generation_cost
+        cost_estimate:
+          usage:
+            input_text_tokens: ${image_input_text_tokens}
+            input_image_tokens: ${image_input_image_tokens}
+            output_text_tokens: ${image_output_text_tokens}
+            output_image_tokens: ${image_output_image_tokens}
+          pricing:
+            input_cost_per_token: ${image_input_cost_per_token}
+            input_cost_per_image_token: ${image_input_cost_per_image_token}
+            output_cost_per_token: 0
+            output_cost_per_image_token: ${image_output_cost_per_image_token}
+          tolerance:
+            absolute: 0.000001
+            percent: 0.01
+        save:
+          - from: estimate.expected_cost
+            as: expected_generation_cost
+          - from: estimate.min_cost
+            as: expected_generation_cost_min
+          - from: estimate.max_cost
+            as: expected_generation_cost_max
+
+      - id: wait_for_gpt_image_2_generation_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${image_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+          poll:
+            timeout_seconds: 30
+            interval_seconds: 3
+            success:
+              json_path: data[0].call_type
+              values:
+                - aimage_generation
+        expect:
+          status: 200
+
+      - id: fetch_gpt_image_2_generation_spend_logs
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${image_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            data[0].model_group: gpt-image-2
+            data[0].call_type: aimage_generation
+          json_exists:
+            - data[0].spend
+          json_number_gte:
+            data[0].spend: ${expected_generation_cost_min}
+          json_number_lte:
+            data[0].spend: ${expected_generation_cost_max}
+
+      - id: edit_gpt_image_2_generated_image
+        request:
+          method: POST
+          path: /v1/images/edits
+          timeout_seconds: 90
+          headers:
+            Authorization: Bearer ${image_key}
+          data:
+            model: gpt-image-2
+            prompt: Add a small blue cube next to the red ball while preserving the original image style.
+            size: 1024x1024
+          files:
+            image:
+              path: ${generated_image_path}
+              filename: gpt-image-2-generated.png
+              content_type: image/png
+        expect:
+          status: 200
+          json_exists:
+            - created
+            - data[0].b64_json
+            - usage.input_tokens
+            - usage.output_tokens
+            - usage.input_tokens_details.text_tokens
+            - usage.input_tokens_details.image_tokens
+            - usage.output_tokens_details.text_tokens
+            - usage.output_tokens_details.image_tokens
+        save:
+          - from: json.usage.input_tokens_details.text_tokens
+            as: image_edit_input_text_tokens
+          - from: json.usage.input_tokens_details.image_tokens
+            as: image_edit_input_image_tokens
+          - from: json.usage.output_tokens_details.text_tokens
+            as: image_edit_output_text_tokens
+          - from: json.usage.output_tokens_details.image_tokens
+            as: image_edit_output_image_tokens
+
+      - id: estimate_gpt_image_2_edit_cost
+        cost_estimate:
+          usage:
+            input_text_tokens: ${image_edit_input_text_tokens}
+            input_image_tokens: ${image_edit_input_image_tokens}
+            output_text_tokens: ${image_edit_output_text_tokens}
+            output_image_tokens: ${image_edit_output_image_tokens}
+          pricing:
+            input_cost_per_token: ${image_input_cost_per_token}
+            input_cost_per_image_token: ${image_input_cost_per_image_token}
+            output_cost_per_token: ${image_output_cost_per_token}
+            output_cost_per_image_token: ${image_output_cost_per_image_token}
+          tolerance:
+            absolute: 0.000001
+            percent: 0.01
+        save:
+          - from: estimate.expected_cost
+            as: expected_edit_cost
+          - from: estimate.min_cost
+            as: expected_edit_cost_min
+          - from: estimate.max_cost
+            as: expected_edit_cost_max
+
+      - id: wait_for_gpt_image_2_edit_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${image_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+          poll:
+            timeout_seconds: 45
+            interval_seconds: 3
+            success:
+              json_path: data[0].call_type
+              values:
+                - aimage_edit
+        expect:
+          status: 200
+
+      - id: fetch_gpt_image_2_edit_spend_logs
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${image_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            data[0].call_type: aimage_edit
+            data[0].model_group: gpt-image-2
+            data[0].status: success
+          json_exists:
+            - data[0].spend
+          json_number_gte:
+            data[0].spend: ${expected_edit_cost_min}
+          json_number_lte:
+            data[0].spend: ${expected_edit_cost_max}
+
+    cleanup:
+      - id: delete_gpt_image_2_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${image_key}
+        expect:
+          status: 200

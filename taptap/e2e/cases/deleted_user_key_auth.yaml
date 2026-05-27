@@ -1,0 +1,62 @@
+suite_version: 1
+id: deleted_user_key_auth
+patch_id: deleted_user_key_auth
+status: active
+description: Verify a key whose user record is missing is rejected before model access.
+
+variables:
+  missing_user_id: taptap-e2e-deleted-user-${run_id}
+  key_alias: taptap-e2e-deleted-user-key-${run_id}
+
+shared:
+  timeout_seconds: 30
+  headers:
+    Content-Type: application/json
+
+scenarios:
+  - id: missing_user_key_is_rejected
+    description: A stale key with a missing user must return 401 at authentication.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_key_for_missing_user
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            user_id: ${missing_user_id}
+            key_alias: ${key_alias}
+            models: []
+        expect:
+          status: 200
+          json_exists:
+            - key
+            - token
+        save:
+          - from: json.key
+            as: missing_user_key
+      - id: missing_user_key_cannot_list_models
+        request:
+          method: GET
+          path: /models
+          headers:
+            Authorization: Bearer ${missing_user_key}
+        expect:
+          status: 401
+          body_contains:
+            - user associated with this key does not exist
+    cleanup:
+      - id: delete_missing_user_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${missing_user_key}
+        expect:
+          status: 200

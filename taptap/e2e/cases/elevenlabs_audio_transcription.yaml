@@ -1,0 +1,296 @@
+suite_version: 1
+id: elevenlabs_audio_transcription
+patch_id: elevenlabs_audio_transcription
+status: active
+description: Verify ElevenLabs scribe_v1 and scribe_v2 transcription compatibility and billing.
+
+variables:
+  elevenlabs_transcription_key_alias: taptap-e2e-elevenlabs-transcription-${run_id}
+  transcription_input_text: Hello from TapTap E2E transcription test.
+
+shared:
+  timeout_seconds: 60
+
+scenarios:
+  - id: scribe_v1_transcription_and_billing
+    description: A temporary key should synthesize MP3 audio, transcribe it with scribe_v1 and scribe_v2, and record correct spend.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_elevenlabs_transcription_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+            Content-Type: application/json
+          json:
+            key_alias: ${elevenlabs_transcription_key_alias}
+            models:
+              - elevenlabs/eleven_v3
+              - elevenlabs/scribe_v1
+              - elevenlabs/scribe_v2
+        expect:
+          status: 200
+          json_exists:
+            - key
+            - token
+        save:
+          - from: json.key
+            as: elevenlabs_transcription_key
+          - from: json.token
+            as: elevenlabs_transcription_token
+
+      - id: public_model_cost_map_has_scribe_model
+        request:
+          method: GET
+          path: /public/litellm_model_cost_map
+        expect:
+          status: 200
+          json_equals:
+            elevenlabs/scribe_v1.litellm_provider: elevenlabs
+            elevenlabs/scribe_v1.mode: audio_transcription
+            elevenlabs/scribe_v1.supported_endpoints[0]: /v1/audio/transcriptions
+            elevenlabs/scribe_v2.litellm_provider: elevenlabs
+            elevenlabs/scribe_v2.mode: audio_transcription
+            elevenlabs/scribe_v2.supported_endpoints[0]: /v1/audio/transcriptions
+        save:
+          - from: json.elevenlabs/scribe_v1.input_cost_per_second
+            as: scribe_input_cost_per_second
+          - from: json.elevenlabs/scribe_v2.input_cost_per_second
+            as: scribe_v2_input_cost_per_second
+
+      - id: elevenlabs_transcription_key_can_see_models
+        request:
+          method: GET
+          path: /models
+          headers:
+            Authorization: Bearer ${elevenlabs_transcription_key}
+        expect:
+          status: 200
+          body_contains:
+            - elevenlabs/eleven_v3
+            - elevenlabs/scribe_v1
+            - elevenlabs/scribe_v2
+
+      - id: generate_elevenlabs_audio_for_transcription
+        request:
+          method: POST
+          path: /v1/audio/speech
+          headers:
+            Authorization: Bearer ${elevenlabs_transcription_key}
+            Content-Type: application/json
+          json:
+            model: elevenlabs/eleven_v3
+            input: ${transcription_input_text}
+            voice: alloy
+            response_format: mp3
+          save_body_to: elevenlabs-transcription-input.mp3
+        expect:
+          status: 200
+          header_equals:
+            Content-Type: audio/mpeg
+        save:
+          - from: file.path
+            as: transcription_audio_path
+
+      - id: probe_transcription_audio
+        media_probe:
+          path: ${transcription_audio_path}
+        expect:
+          media:
+            duration_seconds_gte: 1.0
+        save:
+          - from: media.format.duration_seconds
+            as: transcription_audio_duration_seconds
+
+      - id: transcribe_elevenlabs_audio
+        request:
+          method: POST
+          path: /v1/audio/transcriptions
+          headers:
+            Authorization: Bearer ${elevenlabs_transcription_key}
+          data:
+            model: elevenlabs/scribe_v1
+          files:
+            file:
+              path: ${transcription_audio_path}
+              filename: elevenlabs-transcription-input.mp3
+              content_type: audio/mpeg
+        expect:
+          status: 200
+          header_exists:
+            - x-litellm-call-id
+          json_exists:
+            - text
+        save:
+          - from: header.x-litellm-call-id
+            as: scribe_call_id
+
+      - id: estimate_scribe_cost
+        cost_estimate:
+          usage:
+            input_text_tokens: 0
+            input_seconds: ${transcription_audio_duration_seconds}
+          pricing:
+            input_cost_per_token: 0
+            input_cost_per_second: ${scribe_input_cost_per_second}
+            output_cost_per_token: 0
+          tolerance:
+            absolute: 0.00001
+            percent: 0.05
+        save:
+          - from: estimate.min_cost
+            as: scribe_expected_min_cost
+          - from: estimate.max_cost
+            as: scribe_expected_max_cost
+
+      - id: wait_for_scribe_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            request_id: ${scribe_call_id}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+          poll:
+            timeout_seconds: 45
+            interval_seconds: 3
+            success:
+              json_path: data[0].model_group
+              values:
+                - elevenlabs/scribe_v1
+        expect:
+          status: 200
+
+      - id: fetch_scribe_spend_logs
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            request_id: ${scribe_call_id}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            data[0].call_type: atranscription
+            data[0].model_group: elevenlabs/scribe_v1
+            data[0].custom_llm_provider: elevenlabs
+          json_exists:
+            - data[0].spend
+          json_number_gte:
+            data[0].spend: ${scribe_expected_min_cost}
+          json_number_lte:
+            data[0].spend: ${scribe_expected_max_cost}
+
+      - id: transcribe_elevenlabs_audio_with_scribe_v2
+        request:
+          method: POST
+          path: /v1/audio/transcriptions
+          headers:
+            Authorization: Bearer ${elevenlabs_transcription_key}
+          data:
+            model: elevenlabs/scribe_v2
+          files:
+            file:
+              path: ${transcription_audio_path}
+              filename: elevenlabs-transcription-input.mp3
+              content_type: audio/mpeg
+        expect:
+          status: 200
+          header_exists:
+            - x-litellm-call-id
+          json_exists:
+            - text
+        save:
+          - from: header.x-litellm-call-id
+            as: scribe_v2_call_id
+
+      - id: estimate_scribe_v2_cost
+        cost_estimate:
+          usage:
+            input_text_tokens: 0
+            input_seconds: ${transcription_audio_duration_seconds}
+          pricing:
+            input_cost_per_token: 0
+            input_cost_per_second: ${scribe_v2_input_cost_per_second}
+            output_cost_per_token: 0
+          tolerance:
+            absolute: 0.00001
+            percent: 0.05
+        save:
+          - from: estimate.min_cost
+            as: scribe_v2_expected_min_cost
+          - from: estimate.max_cost
+            as: scribe_v2_expected_max_cost
+
+      - id: wait_for_scribe_v2_spend_log
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            request_id: ${scribe_v2_call_id}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+          poll:
+            timeout_seconds: 45
+            interval_seconds: 3
+            success:
+              json_path: data[0].model_group
+              values:
+                - elevenlabs/scribe_v2
+        expect:
+          status: 200
+
+      - id: fetch_scribe_v2_spend_logs
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            request_id: ${scribe_v2_call_id}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            data[0].call_type: atranscription
+            data[0].model_group: elevenlabs/scribe_v2
+            data[0].custom_llm_provider: elevenlabs
+          json_exists:
+            - data[0].spend
+          json_number_gte:
+            data[0].spend: ${scribe_v2_expected_min_cost}
+          json_number_lte:
+            data[0].spend: ${scribe_v2_expected_max_cost}
+
+    cleanup:
+      - id: delete_elevenlabs_transcription_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+            Content-Type: application/json
+          json:
+            keys:
+              - ${elevenlabs_transcription_token}
+        expect:
+          status: 200

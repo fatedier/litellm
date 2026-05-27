@@ -1,0 +1,200 @@
+suite_version: 1
+id: utc_daily_budget
+patch_id: utc_daily_user_budget_guardrail
+status: active
+description: Verify UTC daily budget guardrail behavior for enforce mode.
+
+variables:
+  user_id: taptap-e2e-budget-user-${run_id}
+  user_email: taptap-e2e-budget-user-${run_id}@example.com
+  team_id: taptap-e2e-budget-team-${run_id}
+  team_alias: taptap-e2e-budget-team-${run_id}
+  team_key_alias: taptap-e2e-budget-team-key-${run_id}
+
+shared:
+  timeout_seconds: 30
+  headers:
+    Content-Type: application/json
+
+scenarios:
+  - id: enforce_blocks_over_budget_personal_user
+    description: Personal user exceeding the daily cap should be blocked.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_budget_user
+        request:
+          method: POST
+          path: /user/new
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            user_id: ${user_id}
+            user_email: ${user_email}
+            user_role: internal_user
+            max_budget: 0.000001
+            budget_duration: 1d
+            models:
+              - gpt-5.5
+        expect:
+          status: 200
+          json_exists:
+            - key
+            - user_id
+        save:
+          - from: json.key
+            as: budget_user_key
+          - from: json.user_id
+            as: budget_user_id
+      - id: warmup_budget_call
+        request:
+          method: POST
+          path: /v1/chat/completions
+          headers:
+            Authorization: Bearer ${budget_user_key}
+          json:
+            model: gpt-5.5
+            messages:
+              - role: user
+                content: |
+                  utc daily budget enforce warmup probe.
+                  Repeat this sentence enough times to ensure at least some billed usage.
+                  Repeat this sentence enough times to ensure at least some billed usage.
+                  Repeat this sentence enough times to ensure at least some billed usage.
+                  Repeat this sentence enough times to ensure at least some billed usage.
+                  Repeat this sentence enough times to ensure at least some billed usage.
+        expect:
+          status: 200
+      - id: wait_for_daily_budget_cache_ttl
+        wait:
+          seconds: 65
+      - id: wait_for_daily_user_spend_rollup
+        request:
+          method: GET
+          path: /user/daily/activity
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            start_date: ${utc_date}
+            end_date: ${utc_date}
+            user_id: ${budget_user_id}
+            page_size: 10
+          poll:
+            timeout_seconds: 180
+            interval_seconds: 5
+            success:
+              json_number_gte:
+                results[0].metrics.spend: 0.0000045
+        expect:
+          status: 200
+      - id: enforce_budget_call
+        request:
+          method: POST
+          path: /v1/chat/completions
+          headers:
+            Authorization: Bearer ${budget_user_key}
+          json:
+            model: gpt-5.5
+            messages:
+              - role: user
+                content: utc daily budget enforce e2e probe
+        expect:
+          status_in:
+            - 400
+            - 403
+            - 429
+          body_contains:
+            - ExceededBudget
+    cleanup:
+      - id: delete_budget_user
+        request:
+          method: POST
+          path: /user/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            user_ids:
+              - ${budget_user_id}
+        expect:
+          status: 200
+
+  - id: team_key_is_not_blocked
+    description: Team-scoped requests should not be blocked by the personal-user rule.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_budget_team
+        request:
+          method: POST
+          path: /team/new
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            team_id: ${team_id}
+            team_alias: ${team_alias}
+            max_budget: 1
+            budget_duration: 1d
+            models:
+              - gpt-5.5
+        expect:
+          status: 200
+          json_exists:
+            - team_id
+      - id: create_budget_team_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            team_id: ${team_id}
+            key_alias: ${team_key_alias}
+            models:
+              - gpt-5.5
+        expect:
+          status: 200
+          json_exists:
+            - key
+        save:
+          - from: json.key
+            as: budget_team_key
+      - id: team_key_budget_call
+        request:
+          method: POST
+          path: /v1/chat/completions
+          headers:
+            Authorization: Bearer ${budget_team_key}
+          json:
+            model: gpt-5.5
+            messages:
+              - role: user
+                content: utc daily budget team-key e2e probe
+        expect:
+          status: 200
+          json_exists:
+            - id
+    cleanup:
+      - id: delete_budget_team_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${budget_team_key}
+        expect:
+          status: 200
+      - id: delete_budget_team
+        request:
+          method: POST
+          path: /team/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            team_ids:
+              - ${team_id}
+        expect:
+          status: 200

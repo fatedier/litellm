@@ -1,0 +1,159 @@
+suite_version: 1
+id: health_inline_mock_local
+patch_id: inline_health_test_connection
+status: local
+description: Local-only mock-provider checks for inline model connection tests.
+
+variables:
+  health_model: openai/health-inline-${run_id}
+  provider_model: health-inline-${run_id}
+  configured_model: openai/health-inline-configured-${run_id}
+  mock_a_url: ${TAPTAP_E2E_MOCK_PROVIDER_A_URL}
+  mock_b_url: ${TAPTAP_E2E_MOCK_PROVIDER_B_URL}
+  mock_a_api_base: ${TAPTAP_E2E_MOCK_PROVIDER_A_API_BASE}
+  mock_b_api_base: ${TAPTAP_E2E_MOCK_PROVIDER_B_API_BASE}
+
+shared:
+  timeout_seconds: 30
+  headers:
+    Content-Type: application/json
+
+scenarios:
+  - id: inline_connection_bypasses_saved_deployment_config
+    description: Inline connection parameters should be used even when the saved deployment points to a failing provider.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+      - TAPTAP_E2E_MOCK_PROVIDER_A_URL
+      - TAPTAP_E2E_MOCK_PROVIDER_B_URL
+      - TAPTAP_E2E_MOCK_PROVIDER_A_API_BASE
+      - TAPTAP_E2E_MOCK_PROVIDER_B_API_BASE
+    steps:
+      - id: reset_health_mock_a
+        request:
+          method: POST
+          url: ${mock_a_url}/reset
+        expect:
+          status: 200
+          json_equals:
+            count: 0
+
+      - id: reset_health_mock_b
+        request:
+          method: POST
+          url: ${mock_b_url}/reset
+        expect:
+          status: 200
+          json_equals:
+            count: 0
+
+      - id: add_saved_health_deployment
+        request:
+          method: POST
+          path: /model/new
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            model_name: ${health_model}
+            litellm_params:
+              model: ${configured_model}
+              api_key: test-key
+              api_base: ${mock_a_api_base}
+            model_info:
+              mode: responses
+        expect:
+          status: 200
+          json_exists:
+            - model_info.id
+        save:
+          - from: json.model_info.id
+            as: health_deployment_id
+
+      - id: inline_health_check_uses_inline_api_base
+        request:
+          method: POST
+          path: /health/test_connection
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            config_source: inline
+            mode: responses
+            litellm_params:
+              model: ${health_model}
+              api_key: test-key
+              api_base: ${mock_b_api_base}
+            model_info: {}
+        expect:
+          status: 200
+          json_equals:
+            status: success
+            result.model: ${health_model}
+            result.api_base: ${mock_b_api_base}
+
+      - id: inline_health_check_surfaces_provider_failure
+        request:
+          method: POST
+          path: /health/test_connection
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            config_source: inline
+            mode: responses
+            litellm_params:
+              model: ${health_model}
+              api_key: test-key
+              api_base: ${mock_a_api_base}
+            model_info: {}
+        expect:
+          status: 200
+          json_equals:
+            status: error
+          body_contains:
+            - ServiceUnavailable
+
+      - id: unauthenticated_inline_health_check_is_rejected
+        request:
+          method: POST
+          path: /health/test_connection
+          json:
+            config_source: inline
+            mode: responses
+            litellm_params:
+              model: ${health_model}
+              api_key: test-key
+              api_base: ${mock_b_api_base}
+            model_info: {}
+        expect:
+          status: 401
+
+      - id: verify_health_mock_events
+        request:
+          method: GET
+          url: ${mock_a_url}/events
+        expect:
+          status: 200
+          json_equals:
+            count: 1
+            events[0].model: ${provider_model}
+
+      - id: verify_success_mock_events
+        request:
+          method: GET
+          url: ${mock_b_url}/events
+        expect:
+          status: 200
+          json_equals:
+            count: 1
+            events[0].model: ${provider_model}
+
+    cleanup:
+      - id: delete_saved_health_deployment
+        request:
+          method: POST
+          path: /model/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            id: ${health_deployment_id}
+        expect:
+          status: 200

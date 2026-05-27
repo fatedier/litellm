@@ -11064,3 +11064,46 @@ async def test_ptu_rollup_job_not_registered_without_opt_in(monkeypatch):
 
     assert scheduler.get_job(PTU_ROLLUP_JOB_ID) is None
     assert len(scheduler.get_jobs()) > 0
+
+
+@pytest.mark.asyncio
+async def test_update_cache_preserves_remaining_user_object_ttl():
+    """The spend writeback must not extend a cached user object's lifetime.
+    The cached blob carries authorization state (models, access_group_ids), so
+    re-setting it with a fresh TTL lets steady traffic renew a stale permission
+    snapshot forever on workers that missed an invalidation."""
+    import asyncio
+
+    from litellm.caching.caching import DualCache
+
+    original_cache = litellm.proxy.proxy_server.user_api_key_cache
+    cache = DualCache()
+    setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
+    try:
+        await cache.async_set_cache(
+            key="ttl-probe-user",
+            value={"user_id": "ttl-probe-user", "spend": 1.0},
+            ttl=10,
+        )
+        expiry_before = cache.in_memory_cache.ttl_dict["ttl-probe-user"]
+
+        await litellm.proxy.proxy_server.update_cache(
+            token=None,
+            user_id="ttl-probe-user",
+            end_user_id=None,
+            team_id=None,
+            response_cost=0.25,
+            parent_otel_span=None,
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        updated = await cache.async_get_cache(key="ttl-probe-user")
+        assert updated is not None
+        updated_spend = updated["spend"] if isinstance(updated, dict) else updated.spend
+        assert updated_spend == 1.25
+
+        expiry_after = cache.in_memory_cache.ttl_dict["ttl-probe-user"]
+        assert expiry_after <= expiry_before + 0.5
+    finally:
+        setattr(litellm.proxy.proxy_server, "user_api_key_cache", original_cache)

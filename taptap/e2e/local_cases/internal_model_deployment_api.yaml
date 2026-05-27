@@ -1,0 +1,395 @@
+suite_version: 1
+id: internal_model_deployment_api_local
+patch_id: internal_model_deployment_api_lifecycle
+status: local
+description: Local-only control-plane checks for internal model deployment lifecycle APIs.
+
+variables:
+  model_name: local-internal-deployment-${run_id}
+  patched_model_name: local-internal-deployment-patched-${run_id}
+  upstream_model: local-internal-upstream-${run_id}
+  patched_base_model: local-internal-base-${run_id}
+  model_alias: taptap-e2e-internal-deployment-${run_id}
+  missing_model_id: missing-internal-deployment-${run_id}
+
+shared:
+  timeout_seconds: 30
+  headers:
+    Content-Type: application/json
+
+scenarios:
+  - id: internal_model_deployment_lifecycle
+    description: A DB-backed deployment should be listed, read, patched, and deleted through the internal API.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_db_deployment_fixture
+        request:
+          method: POST
+          path: /model/new
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            model_name: ${model_name}
+            litellm_params:
+              model: openai/${upstream_model}
+              api_key: test-key
+              api_base: http://example.invalid/v1
+              weight: 1
+            model_info:
+              mode: responses
+              base_model: openai/${upstream_model}
+        expect:
+          status: 200
+          json_exists:
+            - model_info.id
+        save:
+          - from: json.model_info.id
+            as: deployment_id
+
+      - id: list_internal_deployments
+        request:
+          method: GET
+          path: /internal/v1/model-deployments
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+        expect:
+          status: 200
+          header_equals:
+            Cache-Control: no-store
+          json_exists:
+            - data
+          body_contains:
+            - ${model_name}
+
+      - id: get_internal_deployment
+        request:
+          method: GET
+          path: /internal/v1/model-deployments/${deployment_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+        expect:
+          status: 200
+          header_equals:
+            Cache-Control: no-store
+          json_equals:
+            model_id: ${deployment_id}
+            model_name: ${model_name}
+            blocked: false
+            litellm_params.model: openai/${upstream_model}
+            litellm_params.weight: 1
+            model_info.mode: responses
+            model_info.base_model: openai/${upstream_model}
+          json_exists:
+            - created_at
+            - updated_at
+
+      - id: reject_model_tombstone_patch
+        request:
+          method: PATCH
+          path: /internal/v1/model-deployments/${deployment_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            litellm_params:
+              model: null
+        expect:
+          status: 422
+          body_contains:
+            - removing litellm_params fields is not supported
+
+      - id: patch_internal_deployment
+        request:
+          method: PATCH
+          path: /internal/v1/model-deployments/${deployment_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            model_name: ${patched_model_name}
+            litellm_params:
+              weight: 2
+            model_info:
+              base_model: ${patched_base_model}
+        expect:
+          status: 200
+          json_equals:
+            model_id: ${deployment_id}
+
+      - id: verify_internal_patch
+        request:
+          method: GET
+          path: /internal/v1/model-deployments/${deployment_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+        expect:
+          status: 200
+          json_equals:
+            model_id: ${deployment_id}
+            model_name: ${patched_model_name}
+            blocked: false
+            litellm_params.model: openai/${upstream_model}
+            litellm_params.weight: 2
+            model_info.mode: responses
+            model_info.base_model: ${patched_base_model}
+
+      - id: block_internal_deployment
+        request:
+          method: PATCH
+          path: /internal/v1/model-deployments/${deployment_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            blocked: true
+        expect:
+          status: 200
+          json_equals:
+            model_id: ${deployment_id}
+
+      - id: verify_blocked_state
+        request:
+          method: GET
+          path: /internal/v1/model-deployments/${deployment_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+        expect:
+          status: 200
+          json_equals:
+            model_id: ${deployment_id}
+            model_name: ${patched_model_name}
+            blocked: true
+
+      - id: delete_internal_deployment
+        request:
+          method: DELETE
+          path: /internal/v1/model-deployments/${deployment_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+        expect:
+          status: 200
+          json_equals:
+            model_id: ${deployment_id}
+
+      - id: deleted_deployment_is_not_readable
+        request:
+          method: GET
+          path: /internal/v1/model-deployments/${deployment_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+        expect:
+          status: 404
+
+    cleanup:
+      - id: cleanup_internal_deployment
+        request:
+          method: DELETE
+          path: /internal/v1/model-deployments/${deployment_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+        expect:
+          status_in:
+            - 200
+            - 404
+
+  - id: internal_model_deployment_permissions
+    description: A regular virtual key must not access internal model deployment management APIs.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_permission_deployment_fixture
+        request:
+          method: POST
+          path: /model/new
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            model_name: ${model_name}
+            litellm_params:
+              model: openai/${upstream_model}
+              api_key: test-key
+              api_base: http://example.invalid/v1
+            model_info:
+              mode: responses
+        expect:
+          status: 200
+          json_exists:
+            - model_info.id
+        save:
+          - from: json.model_info.id
+            as: deployment_id
+
+      - id: create_regular_virtual_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            key_alias: ${model_alias}
+            models:
+              - ${model_name}
+        expect:
+          status: 200
+          json_exists:
+            - key
+        save:
+          - from: json.key
+            as: regular_key
+
+      - id: regular_key_cannot_list_deployments
+        request:
+          method: GET
+          path: /internal/v1/model-deployments
+          headers:
+            Authorization: Bearer ${regular_key}
+        expect:
+          status: 401
+
+      - id: regular_key_cannot_get_deployment
+        request:
+          method: GET
+          path: /internal/v1/model-deployments/${deployment_id}
+          headers:
+            Authorization: Bearer ${regular_key}
+        expect:
+          status: 401
+
+      - id: regular_key_cannot_patch_deployment
+        request:
+          method: PATCH
+          path: /internal/v1/model-deployments/${deployment_id}
+          headers:
+            Authorization: Bearer ${regular_key}
+          json:
+            blocked: true
+        expect:
+          status: 401
+
+      - id: regular_key_cannot_delete_deployment
+        request:
+          method: DELETE
+          path: /internal/v1/model-deployments/${deployment_id}
+          headers:
+            Authorization: Bearer ${regular_key}
+        expect:
+          status: 401
+
+    cleanup:
+      - id: delete_regular_virtual_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${regular_key}
+        expect:
+          status: 200
+
+      - id: delete_permission_deployment_fixture
+        request:
+          method: POST
+          path: /model/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            id: ${deployment_id}
+        expect:
+          status: 200
+
+  - id: internal_model_deployment_not_found_and_validation
+    description: Internal deployment APIs should reject missing resources and malformed patches with stable client errors.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_validation_deployment_fixture
+        request:
+          method: POST
+          path: /model/new
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            model_name: ${model_name}
+            litellm_params:
+              model: openai/${upstream_model}
+              api_key: test-key
+              api_base: http://example.invalid/v1
+            model_info:
+              mode: responses
+        expect:
+          status: 200
+          json_exists:
+            - model_info.id
+        save:
+          - from: json.model_info.id
+            as: deployment_id
+
+      - id: missing_deployment_get_returns_not_found
+        request:
+          method: GET
+          path: /internal/v1/model-deployments/${missing_model_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+        expect:
+          status: 404
+
+      - id: missing_deployment_patch_returns_not_found
+        request:
+          method: PATCH
+          path: /internal/v1/model-deployments/${missing_model_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            blocked: true
+        expect:
+          status: 404
+
+      - id: missing_deployment_delete_returns_not_found
+        request:
+          method: DELETE
+          path: /internal/v1/model-deployments/${missing_model_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+        expect:
+          status: 404
+
+      - id: empty_patch_returns_unprocessable_entity
+        request:
+          method: PATCH
+          path: /internal/v1/model-deployments/${deployment_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json: {}
+        expect:
+          status: 422
+          body_contains:
+            - patch must contain at least one field
+
+      - id: unsupported_model_info_patch_returns_unprocessable_entity
+        request:
+          method: PATCH
+          path: /internal/v1/model-deployments/${deployment_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            model_info:
+              id: replacement-id
+        expect:
+          status: 422
+          body_contains:
+            - updating model_info fields is not supported
+
+    cleanup:
+      - id: delete_validation_deployment_fixture
+        request:
+          method: POST
+          path: /model/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            id: ${deployment_id}
+        expect:
+          status: 200

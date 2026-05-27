@@ -1,0 +1,260 @@
+suite_version: 1
+id: seedance_passthrough
+patch_id: nova_aigateway_passthrough_billing
+status: active
+description: Verify Seedance routing through Nova AI Gateway, billing, and media artifact generation.
+
+variables:
+  seedance_path: ${TAPTAP_E2E_SEEDANCE_PATH:/volcengine/api/v3/contents/generations/tasks}
+  seedance_key_alias: taptap-e2e-seedance-key-${run_id}
+  not_found_key_alias: taptap-e2e-seedance-not-found-${run_id}
+  missing_task_id: taptap-e2e-missing-${run_id}
+  prompt_text: A single bright red ball moves from left to right across a plain white background.
+
+shared:
+  timeout_seconds: 45
+  headers:
+    Content-Type: application/json
+
+scenarios:
+  - id: get_missing_task_does_not_write_spend_log
+    description: Verify a Nova AI Gateway GET 404 does not create a spend log.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_not_found_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            key_alias: ${not_found_key_alias}
+        expect:
+          status: 200
+          json_exists:
+            - key
+        save:
+          - from: json.key
+            as: not_found_key
+          - from: json.token
+            as: not_found_key_hash
+
+      - id: get_missing_seedance_task
+        request:
+          method: GET
+          path: ${seedance_path}/${missing_task_id}
+          headers:
+            Authorization: Bearer ${not_found_key}
+        expect:
+          status: 404
+
+      - id: wait_for_spend_log_flush
+        wait:
+          seconds: 30
+
+      - id: fetch_spend_logs_for_not_found_key
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${not_found_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            total: 0
+            data: []
+
+    cleanup:
+      - id: delete_not_found_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${not_found_key}
+        expect:
+          status: 200
+
+  - id: full_generation_flow
+    description: Create a Seedance task through Nova AI Gateway, poll to completion, verify spend logs, and validate the downloaded video artifact.
+    requires_env:
+      - TAPTAP_E2E_BASE_URL
+      - TAPTAP_E2E_MASTER_KEY
+    steps:
+      - id: create_seedance_key
+        request:
+          method: POST
+          path: /key/generate
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            key_alias: ${seedance_key_alias}
+        expect:
+          status: 200
+          json_exists:
+            - key
+        save:
+          - from: json.key
+            as: seedance_key
+          - from: json.token
+            as: seedance_key_hash
+
+      - id: create_seedance_task
+        request:
+          method: POST
+          path: ${seedance_path}
+          headers:
+            Authorization: Bearer ${seedance_key}
+          json:
+            model: doubao-seedance-2-0-260128
+            content:
+              - type: text
+                text: ${prompt_text}
+            ratio: 16:9
+            duration: 4
+        expect:
+          status: 200
+        save:
+          - from_any:
+              - json.id
+              - json.task_id
+              - json.data.id
+              - json.data.task_id
+              - json.data.task.id
+              - json.data.task.task_id
+              - json.task.id
+              - json.task.task_id
+            as: seedance_task_id
+
+      - id: poll_seedance_task
+        request:
+          method: GET
+          path: ${seedance_path}/${seedance_task_id}
+          headers:
+            Authorization: Bearer ${seedance_key}
+          timeout_seconds: 45
+          poll:
+            timeout_seconds: 420
+            interval_seconds: 5
+            success:
+              json_path_any:
+                - status
+                - data.status
+                - task.status
+              values:
+                - succeeded
+                - success
+                - completed
+                - done
+            failure:
+              json_path_any:
+                - status
+                - data.status
+                - task.status
+              values:
+                - failed
+                - error
+        expect:
+          status: 200
+        save:
+          - from_any:
+              - json.content.video_url
+              - json.video_url
+              - json.output.video_url
+              - json.data.video_url
+              - json.data.output.video_url
+              - json.data.result.video_url
+              - json.data.outputs[0].url
+              - json.task.video_url
+              - json.task.output.video_url
+            as: seedance_video_url
+
+      - id: fetch_spend_logs_for_seedance_key
+        request:
+          method: GET
+          path: /spend/logs/v2
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          params:
+            api_key: ${seedance_key_hash}
+            start_date: ${utc_date} 00:00:00
+            end_date: ${utc_date} 23:59:59
+            page: 1
+            page_size: 5
+        expect:
+          status: 200
+          json_equals:
+            data[0].metadata.spend_logs_metadata.task_id: ${seedance_task_id}
+            data[0].metadata.spend_logs_metadata.ratio: "16:9"
+            data[0].metadata.spend_logs_metadata.cost_tracking_strategy: seedance_video_generation
+          json_exists:
+            - data[0].spend
+            - data[0].metadata.spend_logs_metadata.duration
+
+      - id: download_seedance_video
+        request:
+          method: GET
+          url: ${seedance_video_url}
+          save_body_to: seedance-output.mp4
+        expect:
+          status: 200
+        save:
+          - from: file.path
+            as: seedance_video_path
+
+      - id: probe_seedance_video
+        media_probe:
+          path: ${seedance_video_path}
+        expect:
+          media:
+            video_streams_gte: 1
+            width_gte: 100
+            height_gte: 100
+            duration_seconds_gte: 1
+            duration_seconds_lte: 30
+            aspect_ratio: 16:9
+            aspect_ratio_tolerance: 0.08
+
+      - id: extract_seedance_frames
+        frame_extract:
+          path: ${seedance_video_path}
+          outputs:
+            - name: start
+              at_seconds: 0.0
+              filename: seedance-frame-start.png
+            - name: middle
+              at_seconds: 2.0
+              filename: seedance-frame-middle.png
+            - name: end
+              at_seconds: 3.5
+              filename: seedance-frame-end.png
+        save:
+          - from: frames.start.path
+            as: seedance_frame_start
+          - from: frames.middle.path
+            as: seedance_frame_middle
+          - from: frames.end.path
+            as: seedance_frame_end
+
+    cleanup:
+      - id: delete_seedance_key
+        request:
+          method: POST
+          path: /key/delete
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+          json:
+            keys:
+              - ${seedance_key}
+        expect:
+          status: 200
