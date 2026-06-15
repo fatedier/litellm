@@ -2680,6 +2680,13 @@ class Logging(LiteLLMLoggingBaseClass):
             global_callbacks=litellm._async_success_callback,
         )
 
+        await _async_enqueue_proxy_nova_aigateway_log(
+            cast(
+                Optional[StandardLoggingPayload],
+                self.model_call_details.get("standard_logging_object"),
+            )
+        )
+
         result = redact_message_input_output_from_logging(
             model_call_details=(self.model_call_details if hasattr(self, "model_call_details") else {}),
             result=result,
@@ -3176,6 +3183,13 @@ class Logging(LiteLLMLoggingBaseClass):
         )
 
         result: Final = None  # result sent to all loggers, init this to None incase it's not created
+
+        await _async_enqueue_proxy_nova_aigateway_log(
+            cast(
+                Optional[StandardLoggingPayload],
+                self.model_call_details.get("standard_logging_object"),
+            )
+        )
 
         self.has_run_logging(event_type="async_failure")
         for callback in callbacks:
@@ -4641,6 +4655,37 @@ def get_custom_logger_compatible_class(
     except Exception as e:
         verbose_logger.exception("[Non-Blocking Error] Error getting custom logger: %s", e)
         return None
+
+
+async def _async_enqueue_proxy_nova_aigateway_log(
+    standard_logging_object: Optional[StandardLoggingPayload],
+) -> None:
+    if standard_logging_object is None:
+        return
+
+    metadata = standard_logging_object.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        return
+    user_api_key_user_id = metadata.get("user_api_key_user_id")
+    if user_api_key_user_id is None or not str(user_api_key_user_id).strip():
+        return
+
+    proxy_nova_aigateway_service = getattr(
+        litellm, "proxy_nova_aigateway_service", None
+    )
+    if proxy_nova_aigateway_service is None:
+        return
+
+    try:
+        nova_payload = cast(
+            StandardLoggingPayload, copy.deepcopy(standard_logging_object)
+        )
+        await proxy_nova_aigateway_service.enqueue(nova_payload)
+    except Exception as e:
+        verbose_logger.exception(
+            "LiteLLM.LoggingError: [Non-Blocking] Exception occurred while enqueueing Nova AI Gateway log %s",
+            str(e),
+        )
 
 
 def _get_custom_logger_settings_from_proxy_server(callback_name: str) -> dict:

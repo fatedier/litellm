@@ -425,6 +425,10 @@ datadog_llm_observability_params: Optional[Union[DatadogLLMObsInitParams, Dict]]
 datadog_params: Optional[Union[DatadogInitParams, Dict]] = None
 newrelic_params: Optional[Union[NewRelicInitParams, Dict]] = None
 aws_sqs_callback_params: Optional[Dict] = None
+# Proxy-only Nova audit logging config. This is intentionally file/env backed and
+# is not expected to be sourced from DB/UI-managed litellm_settings.
+nova_aigateway: Optional[Dict[str, Any]] = None
+proxy_nova_aigateway_service: Optional[Any] = None
 generic_logger_headers: Optional[Dict] = None
 default_key_generate_params: Optional[Dict] = None
 default_key_max_budget_alert_emails: Optional[Dict[str, list]] = None

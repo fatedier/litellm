@@ -252,6 +252,7 @@ from litellm.constants import (
 from litellm.exceptions import RejectedRequestError
 from litellm.integrations.custom_guardrail import ModifyResponseException
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.integrations.nova_aigateway import NovaAIGatewayLogService
 from litellm.integrations.SlackAlerting.slack_alerting import SlackAlerting
 from litellm.litellm_core_utils.core_helpers import (
     _get_parent_otel_span_from_kwargs,
@@ -849,6 +850,44 @@ def cleanup_router_config_variables():
     health_check_interval = None
     health_check_concurrency = None
     prisma_client = None
+    litellm.nova_aigateway = None
+    litellm.proxy_nova_aigateway_service = None
+
+
+async def _initialize_proxy_nova_aigateway_service() -> None:
+    # Nova audit logging is intentionally initialized from the process-local
+    # file/env config already loaded into `litellm.nova_aigateway`. It does not
+    # consume DB/UI-managed litellm_settings or support runtime re-init.
+    # This service is only wired into the normal proxy lifespan startup path and is
+    # not expected to start on embedded/test-only initialize(config=...) code paths.
+    existing_service = getattr(litellm, "proxy_nova_aigateway_service", None)
+    if existing_service is not None:
+        await existing_service.stop()
+        litellm.proxy_nova_aigateway_service = None
+
+    nova_aigateway_config = getattr(litellm, "nova_aigateway", None)
+    if not isinstance(nova_aigateway_config, dict):
+        return
+
+    if not NovaAIGatewayLogService.is_enabled_in_config(nova_aigateway_config):
+        return
+
+    service = NovaAIGatewayLogService.from_config(nova_aigateway_config)
+    await service.start()
+    litellm.proxy_nova_aigateway_service = service
+
+
+async def _shutdown_proxy_nova_aigateway_service() -> None:
+    proxy_nova_aigateway_service = getattr(
+        litellm, "proxy_nova_aigateway_service", None
+    )
+    if proxy_nova_aigateway_service is None:
+        return
+
+    try:
+        await proxy_nova_aigateway_service.stop()
+    finally:
+        litellm.proxy_nova_aigateway_service = None
 
 
 async def _flush_spend_logs_queue_on_shutdown() -> None:
@@ -870,6 +909,7 @@ async def _flush_spend_logs_queue_on_shutdown() -> None:
 async def proxy_shutdown_event():
     global prisma_client, master_key, user_custom_auth, user_custom_key_generate, user_custom_key_update
     verbose_proxy_logger.info("Shutting down LiteLLM Proxy Server")
+    await _shutdown_proxy_nova_aigateway_service()
     if prisma_client:
         # Drain the SGR fold first: it lives in memory, so an un-drained interval
         # is lost, and a write attempted after disconnect raises
@@ -1122,6 +1162,7 @@ async def proxy_startup_event(app: FastAPI):
         proxy_logging_obj=proxy_logging_obj,
         redis_usage_cache=transaction_buffer_redis_cache,
     )
+    await _initialize_proxy_nova_aigateway_service()
 
     ## V2 OTEL: publish the chosen V2 logger's TracerProvider as the OTel global.
     ## This MUST run after callback initialization above: a preset (arize, langfuse,
@@ -4671,6 +4712,7 @@ class ProxyConfig:
         litellm_settings = config.get("litellm_settings", None)
         if litellm_settings is None:
             litellm_settings = {}
+        litellm.nova_aigateway = litellm_settings.get("nova_aigateway")
         if litellm_settings:
             # ANSI escape code for blue text
             blue_color_code: Final = "\033[94m"
