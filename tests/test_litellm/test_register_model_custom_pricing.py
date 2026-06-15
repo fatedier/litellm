@@ -10,6 +10,7 @@ calculations for DB-sourced models with prompt caching pricing.
 """
 
 import copy
+from copy import deepcopy
 import os
 import sys
 
@@ -21,6 +22,7 @@ sys.path.insert(
 
 import litellm
 from litellm.main import _build_custom_pricing_entry
+from litellm.types.router import ModelInfo
 from litellm.utils import _invalidate_model_cost_lowercase_map
 
 
@@ -41,6 +43,7 @@ def test_build_custom_pricing_entry_includes_all_kwargs_fields():
     """All CustomPricingLiteLLMParams fields present in kwargs should be
     included in the resulting entry dict."""
     kwargs = {
+        "nova_cost_discount": 0.8,
         "input_cost_per_token": 0.001,
         "output_cost_per_token": 0.002,
         "cache_read_input_token_cost": 0.00025,
@@ -56,6 +59,7 @@ def test_build_custom_pricing_entry_includes_all_kwargs_fields():
     )
 
     assert entry["litellm_provider"] == "openai"
+    assert entry["nova_cost_discount"] == 0.8
     assert entry["input_cost_per_token"] == 0.001
     assert entry["output_cost_per_token"] == 0.002
     assert entry["cache_read_input_token_cost"] == 0.00025
@@ -63,6 +67,118 @@ def test_build_custom_pricing_entry_includes_all_kwargs_fields():
     assert entry["output_cost_per_reasoning_token"] == 0.01
     assert entry["input_cost_per_audio_token"] == 0.003
     assert "unrelated_kwarg" not in entry
+
+
+def test_model_info_validates_nova_discount():
+    ModelInfo(nova_cost_discount=0.8)
+    with pytest.raises(ValueError, match="nova_cost_discount must be between 0 and 1"):
+        ModelInfo(nova_cost_discount=1.1)
+
+
+def test_router_registers_model_info_nova_discount_and_litellm_params_override():
+    original_model_cost = deepcopy(litellm.model_cost)
+
+    model_info_only_id = "nova-model-info-discount-only"
+    litellm_params_only_id = "nova-litellm-params-discount-only"
+    litellm_params_override_id = "nova-litellm-params-discount-override"
+
+    try:
+        litellm.Router(
+            model_list=[
+                {
+                    "model_name": "nova-discount-test",
+                    "litellm_params": {
+                        "model": "openai/gpt-4o-mini",
+                        "api_key": "test-api-key",
+                    },
+                    "model_info": {
+                        "id": model_info_only_id,
+                        "nova_cost_discount": 0.6,
+                    },
+                },
+                {
+                    "model_name": "nova-discount-test",
+                    "litellm_params": {
+                        "model": "openai/gpt-4o-mini",
+                        "api_key": "test-api-key",
+                        "nova_cost_discount": 0.7,
+                    },
+                    "model_info": {
+                        "id": litellm_params_only_id,
+                    },
+                },
+                {
+                    "model_name": "nova-discount-test",
+                    "litellm_params": {
+                        "model": "openai/gpt-4o-mini",
+                        "api_key": "test-api-key",
+                        "nova_cost_discount": 0.8,
+                    },
+                    "model_info": {
+                        "id": litellm_params_override_id,
+                        "nova_cost_discount": 0.4,
+                    },
+                },
+            ]
+        )
+
+        model_info_only = litellm.model_cost.get(model_info_only_id)
+        assert model_info_only is not None
+        assert model_info_only["nova_cost_discount"] == 0.6
+
+        litellm_params_only = litellm.model_cost.get(litellm_params_only_id)
+        assert litellm_params_only is not None
+        assert litellm_params_only["nova_cost_discount"] == 0.7
+
+        litellm_params_override = litellm.model_cost.get(litellm_params_override_id)
+        assert litellm_params_override is not None
+        assert litellm_params_override["nova_cost_discount"] == 0.8
+    finally:
+        litellm.model_cost = original_model_cost
+
+
+def test_router_completion_allows_litellm_params_nova_discount():
+    original_model_cost = deepcopy(litellm.model_cost)
+
+    model_id = "nova-router-litellm-params-runtime-discount"
+
+    try:
+        router = litellm.Router(
+            model_list=[
+                {
+                    "model_name": "nova-runtime-discount-test",
+                    "litellm_params": {
+                        "model": "openai/gpt-4o-mini",
+                        "api_key": "test-api-key",
+                        "nova_cost_discount": 0.8,
+                    },
+                    "model_info": {
+                        "id": model_id,
+                    },
+                },
+            ]
+        )
+
+        messages = [{"role": "user", "content": "hello"}]
+        discounted_response = router.completion(
+            model="nova-runtime-discount-test",
+            messages=messages,
+            mock_response="ok",
+            max_tokens=20,
+        )
+        undiscounted_response = litellm.completion(
+            model="openai/gpt-4o-mini",
+            messages=messages,
+            mock_response="ok",
+            max_tokens=20,
+        )
+
+        assert discounted_response._hidden_params["response_cost"] == pytest.approx(
+            undiscounted_response._hidden_params["response_cost"] * 0.2,
+            rel=1e-9,
+        )
+    finally:
+        litellm.model_cost = original_model_cost
 
 
 def test_build_custom_pricing_entry_merges_model_info_metadata():

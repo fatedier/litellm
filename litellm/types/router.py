@@ -147,6 +147,7 @@ class ModelInfo(MirroredPricingParams):
 
     base_model: str | None = None  # specify if the base model is azure/gpt-3.5-turbo etc for accurate cost tracking
     tier: Literal["free", "paid"] | None = None
+    nova_cost_discount: float | None = None
 
     """
     Team Model Specific Fields
@@ -208,6 +209,13 @@ class ModelInfo(MirroredPricingParams):
         if start is not None and end is not None and end <= start:
             raise ValueError("ptu_effective_to must be after ptu_effective_from")
         return self
+
+    @field_validator("nova_cost_discount")
+    @classmethod
+    def validate_nova_cost_discount(cls, value: float | None) -> float | None:
+        if value is not None and not 0 <= value <= 1:
+            raise ValueError("nova_cost_discount must be between 0 and 1")
+        return value
 
     model_config = ConfigDict(extra="allow")
 

@@ -156,6 +156,7 @@ _SPEECH_CALL_TYPES: Final = frozenset(
     }
 )
 
+_NOVA_COST_DISCOUNT_FIELD = "nova_cost_discount"
 _TRANSCRIPTION_CALL_TYPES: Final = frozenset(
     {
         CallTypes.atranscription.value,
@@ -945,13 +946,17 @@ def _infer_call_type(call_type: CallTypesLiteral | None, completion_response: An
 def _apply_cost_discount(
     base_cost: float,
     custom_llm_provider: str | None,
+    model: str | None = None,
+    model_info: ModelInfo | None = None,
 ) -> tuple[float, float, float]:
     """
-    Apply provider-specific cost discount from module-level config.
+    Apply deployment-specific Nova discount or provider-specific discount config.
 
     Args:
         base_cost: The base cost before discount
         custom_llm_provider: The LLM provider name
+        model: Model cost-map key used for cost calculation
+        model_info: Optional deployment/model pricing metadata
 
     Returns:
         Tuple of (final_cost, discount_percent, discount_amount)
@@ -960,20 +965,49 @@ def _apply_cost_discount(
     discount_percent = 0.0
     discount_amount = 0.0
 
-    if custom_llm_provider and custom_llm_provider in litellm.cost_discount_config:
+    nova_cost_discount = _get_nova_cost_discount(model=model, model_info=model_info)
+    discount_source = custom_llm_provider
+    if nova_cost_discount is not None:
+        discount_percent = nova_cost_discount
+        discount_source = _NOVA_COST_DISCOUNT_FIELD
+    elif custom_llm_provider and custom_llm_provider in litellm.cost_discount_config:
         discount_percent = litellm.cost_discount_config[custom_llm_provider]
+
+    if discount_percent:
         discount_amount = original_cost * discount_percent
         final_cost: Final = original_cost - discount_amount
 
         if verbose_logger.isEnabledFor(logging.DEBUG):
             verbose_logger.debug(
-                f"Applied {discount_percent * 100}% discount to {custom_llm_provider}: "
+                f"Applied {discount_percent*100}% discount to {discount_source}: "
                 f"${original_cost:.6f} -> ${final_cost:.6f} (saved ${discount_amount:.6f})"
             )
 
         return final_cost, discount_percent, discount_amount
 
     return base_cost, discount_percent, discount_amount
+
+
+def _get_nova_cost_discount(
+    model: str | None = None,
+    model_info: ModelInfo | None = None,
+) -> float | None:
+    discount: Any = None
+    if model_info is not None:
+        discount = cast(dict, model_info).get(_NOVA_COST_DISCOUNT_FIELD)
+
+    if discount is None and model is not None:
+        registered_model_info = litellm.model_cost.get(model)
+        if isinstance(registered_model_info, dict):
+            discount = registered_model_info.get(_NOVA_COST_DISCOUNT_FIELD)
+
+    if discount is None:
+        return None
+
+    discount_float = float(discount)
+    if not 0 <= discount_float <= 1:
+        raise ValueError("nova_cost_discount must be between 0 and 1")
+    return discount_float
 
 
 def _apply_cost_margin(
@@ -1463,6 +1497,7 @@ def completion_cost(
                     ) = _apply_cost_discount(
                         base_cost=_final_cost,
                         custom_llm_provider=custom_llm_provider,
+                        model=router_model_id or model,
                     )
 
                     # Apply margin from module-level config if configured
@@ -1615,18 +1650,15 @@ def completion_cost(
                     _final_cost += sum(additional_costs.values())
 
                 original_cost = _final_cost
-                if litellm.cost_discount_config:
-                    (
-                        _final_cost,
-                        discount_percent,
-                        discount_amount,
-                    ) = _apply_cost_discount(
-                        base_cost=_final_cost,
-                        custom_llm_provider=custom_llm_provider,
-                    )
-                else:
-                    discount_percent = 0.0
-                    discount_amount = 0.0
+                (
+                    _final_cost,
+                    discount_percent,
+                    discount_amount,
+                ) = _apply_cost_discount(
+                    base_cost=_final_cost,
+                    custom_llm_provider=custom_llm_provider,
+                    model=router_model_id or model,
+                )
 
                 # Apply margin from module-level config if configured
                 if litellm.cost_margin_config:

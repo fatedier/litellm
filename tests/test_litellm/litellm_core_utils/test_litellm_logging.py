@@ -175,6 +175,28 @@ def test_use_custom_pricing_for_model():
     assert use_custom_pricing_for_model(litellm_params) == True
 
 
+def test_nova_cost_discount_does_not_enable_custom_pricing():
+    from litellm.litellm_core_utils.litellm_logging import use_custom_pricing_for_model
+
+    logging_obj = LitellmLogging(
+        model="openai/gpt-4o-mini",
+        messages=[{"role": "user", "content": "Hey"}],
+        stream=False,
+        call_type="completion",
+        start_time=time.time(),
+        litellm_call_id="nova-discount-test",
+        function_id="nova-discount-test",
+    )
+    logging_obj.update_environment_variables(
+        litellm_params={"nova_cost_discount": 0.85},
+        optional_params={},
+    )
+
+    assert logging_obj.litellm_params["nova_cost_discount"] == 0.85
+    assert logging_obj.custom_pricing is False
+    assert use_custom_pricing_for_model(logging_obj.litellm_params) is False
+
+
 def test_use_custom_pricing_for_model_via_litellm_metadata():
     """Pricing in litellm_metadata.model_info must be detected.
 

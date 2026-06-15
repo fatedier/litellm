@@ -236,6 +236,7 @@ class ModelInfoBase(ProviderSpecificModelInfo, total=False):
     input_cost_per_token_batches: float | None
     output_cost_per_token_batches: float | None
     output_cost_per_token: Required[float | None]
+    nova_cost_discount: float | None
     output_cost_per_token_flex: float | None  # OpenAI flex service tier pricing
     output_cost_per_token_priority: float | None  # OpenAI priority service tier pricing
     regional_processing_uplift_multiplier_eu: (
@@ -3272,6 +3273,7 @@ class CustomPricingLiteLLMParams(MirroredPricingParams):
     output_cost_per_second_1080p: float | None = None
     input_cost_per_pixel: float | None = None
     output_cost_per_pixel: float | None = None
+    nova_cost_discount: float | None = None
 
     # Include all ModelInfoBase fields as optional
     # This allows any model_info parameter to be set in litellm_params
@@ -3355,6 +3357,13 @@ class CustomPricingLiteLLMParams(MirroredPricingParams):
         backend model. Full pricing stays under the deployment's unique model id.
         """
         return {k: v for k, v in model_info.items() if k not in cls.model_fields}
+
+    @field_validator("nova_cost_discount")
+    @classmethod
+    def validate_nova_cost_discount(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and not 0 <= value <= 1:
+            raise ValueError("nova_cost_discount must be between 0 and 1")
+        return value
 
 
 SHARED_BACKEND_MODEL_INFO_FIELDS: Final[frozenset[str]] = frozenset(

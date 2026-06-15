@@ -1842,6 +1842,67 @@ def test_cost_discount_not_applied_to_other_providers():
     print(f"  - Cost remains unchanged: ${cost_with_selective_discount:.6f}")
 
 
+def test_nova_cost_discount_from_router_model_id_overrides_provider_discount():
+    """
+    Test that deployment-level Nova discount is applied using the router model id
+    and takes precedence over provider-level discount config.
+    """
+    from litellm import completion_cost
+    from litellm.types.utils import Usage
+
+    original_discount_config = litellm.cost_discount_config.copy()
+    original_model_cost = litellm.model_cost.copy()
+
+    def _response() -> ModelResponse:
+        return ModelResponse(
+            id="test-id",
+            choices=[],
+            created=1234567890,
+            model="gpt-4",
+            object="chat.completion",
+            usage=Usage(prompt_tokens=100, completion_tokens=50, total_tokens=150),
+        )
+
+    try:
+        os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+        litellm.model_cost = litellm.get_model_cost_map(url="")
+
+        litellm.cost_discount_config = {}
+        base_cost = completion_cost(
+            completion_response=_response(),
+            model="gpt-4",
+            custom_llm_provider="openai",
+        )
+
+        deployment_model_id = "test-nova-discount-deployment"
+        litellm.model_cost[deployment_model_id] = {
+            **litellm.model_cost["gpt-4"],
+            "nova_cost_discount": 0.8,
+        }
+
+        litellm.cost_discount_config = {"openai": 0.05}
+        discounted_cost = completion_cost(
+            completion_response=_response(),
+            model="gpt-4",
+            custom_llm_provider="openai",
+            custom_pricing=False,
+            router_model_id=deployment_model_id,
+        )
+
+        assert discounted_cost == pytest.approx(base_cost * 0.2, rel=1e-9)
+    finally:
+        litellm.cost_discount_config = original_discount_config
+        litellm.model_cost = original_model_cost
+
+
+def test_nova_cost_discount_validation():
+    from litellm.types.utils import CustomPricingLiteLLMParams
+
+    CustomPricingLiteLLMParams(nova_cost_discount=0.8)
+    with pytest.raises(ValueError, match="nova_cost_discount must be between 0 and 1"):
+        CustomPricingLiteLLMParams(nova_cost_discount=1.1)
+
+
 def test_cost_margin_percentage():
     """
     Test that percentage-based cost margin is applied correctly

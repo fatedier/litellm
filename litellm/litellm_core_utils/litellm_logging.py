@@ -237,7 +237,9 @@ _STANDARD_LOGGING_METADATA_KEYS: Final[frozenset[str]] = frozenset(StandardLoggi
 ### GLOBAL VARIABLES ###
 
 # Cache custom pricing keys as frozenset for O(1) lookups instead of looping through 49 keys
-_CUSTOM_PRICING_KEYS: Final[frozenset[str]] = frozenset(CustomPricingLiteLLMParams.model_fields.keys())
+_CUSTOM_PRICING_KEYS: Final[frozenset[str]] = frozenset(
+    CustomPricingLiteLLMParams.model_fields.keys() - {"nova_cost_discount"}
+)
 
 sentry_sdk_instance = None
 capture_exception = None
