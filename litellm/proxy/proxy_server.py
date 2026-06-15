@@ -569,6 +569,9 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     router as pass_through_router,
 )
+from litellm.proxy.pass_through_endpoints.websocket_auth_passthrough import (
+    initialize_websocket_auth_passthrough_endpoints,
+)
 from litellm.proxy.public_endpoints import router as public_endpoints_router
 from litellm.proxy.rag_endpoints.endpoints import router as rag_router
 from litellm.proxy.rerank_endpoints.endpoints import router as rerank_router
@@ -6283,6 +6286,10 @@ class ProxyConfig:
         if "pass_through_endpoints" in _general_settings:
             general_settings["pass_through_endpoints"] = _general_settings["pass_through_endpoints"]
             await initialize_pass_through_endpoints(pass_through_endpoints=general_settings["pass_through_endpoints"])
+        # Intentionally do not load websocket_pass_through_endpoints from DB.
+        # This route type is config-file only because WebSocket auth passthrough
+        # is an infrastructure-level proxy contract, not a UI/API-managed
+        # runtime setting.
 
         ## UI ACCESS MODE ##
         if "ui_access_mode" in _general_settings:
@@ -6444,6 +6451,12 @@ class ProxyConfig:
             for key, value in db_param_value.items():
                 if key in LITELLM_SETTINGS_SAFE_DB_OVERRIDES:  # params that are safe to override with db values
                     setattr(litellm, key, value)
+
+        if param_name == "general_settings" and isinstance(db_param_value, dict):
+            db_param_value = dict(db_param_value)
+            # WebSocket auth passthrough routes are config-file only. Ignore
+            # stale/manual DB rows so DB-merged settings cannot register tunnels.
+            db_param_value.pop("websocket_pass_through_endpoints", None)
 
         # If param doesn't exist in config, add it
         if param_name not in current_config:

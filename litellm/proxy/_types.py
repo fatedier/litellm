@@ -2176,6 +2176,51 @@ class PassThroughGenericEndpoint(LiteLLMPydanticObjectBase):
     )
 
 
+class WebSocketPassThroughEndpoint(LiteLLMPydanticObjectBase):
+    path: str = Field(description="The WebSocket route to add to the proxy server.")
+    target: str = Field(
+        description="The upstream WebSocket URL to which frames should be forwarded."
+    )
+    headers: dict[str, str] = Field(
+        default_factory=dict,
+        description="Service-to-service headers to send to the upstream WebSocket.",
+    )
+    forward_headers: bool = Field(
+        default=False,
+        description="Whether to forward safe client headers to the upstream WebSocket.",
+    )
+    auth: bool = Field(
+        default=True,
+        description="Whether the incoming WebSocket requires LiteLLM API key authentication. v1 only supports true.",
+    )
+    forward_query_params: bool = Field(
+        default=True,
+        description="Whether to forward client query parameters to the upstream WebSocket URL.",
+    )
+    forward_subprotocols: bool = Field(
+        default=True,
+        description="Whether to forward non-secret WebSocket subprotocols to the upstream.",
+    )
+    inject_litellm_auth_context: bool = Field(
+        default=True,
+        description="Whether to inject X-LiteLLM-Auth-Context with the authenticated key hash and call id.",
+    )
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    @model_validator(mode="after")
+    def validate_websocket_passthrough_endpoint(self):
+        if not self.path.startswith("/"):
+            raise ValueError("websocket passthrough path must start with '/'.")
+        if not self.target.startswith("ws://"):
+            # v1 is intended for in-cluster auth-only forwarding to Nova. Keep it
+            # ws:// only so this path does not need a separate WSS/TLS contract.
+            raise ValueError("websocket passthrough target must start with ws://.")
+        if self.auth is not True:
+            raise ValueError("websocket passthrough v1 requires auth=true.")
+        return self
+
+
 class PassThroughEndpointResponse(LiteLLMPydanticObjectBase):
     endpoints: list[PassThroughGenericEndpoint]
 

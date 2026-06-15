@@ -1138,6 +1138,28 @@ def test_update_config_fields():
     assert team_config["langfuse_secret"] == "my-fake-secret"
 
 
+def test_update_config_fields_filters_websocket_passthrough_from_db_general_settings():
+    from litellm.proxy.proxy_server import ProxyConfig
+
+    proxy_config = ProxyConfig()
+    db_general_settings = {
+        "master_key": "sk-db-master-key",
+        "websocket_pass_through_endpoints": [
+            {"path": "/nova/realtime", "target": "ws://nova-aigateway/realtime"}
+        ],
+    }
+
+    updated_config = proxy_config._update_config_fields(
+        current_config={"general_settings": {"database_url": "postgres://file-db"}},
+        param_name="general_settings",
+        db_param_value=db_general_settings,
+    )
+
+    assert "websocket_pass_through_endpoints" not in updated_config["general_settings"]
+    assert updated_config["general_settings"]["master_key"] == "sk-db-master-key"
+    assert "websocket_pass_through_endpoints" in db_general_settings
+
+
 def test_update_config_fields_default_internal_user_params(monkeypatch):
     from litellm.proxy.proxy_server import ProxyConfig
 
