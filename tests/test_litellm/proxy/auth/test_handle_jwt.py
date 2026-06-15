@@ -163,6 +163,10 @@ async def test_find_team_with_model_access_reports_passthrough_allowlist_denial(
             return_value=True,
         ) as mock_is_auth_enforced_pass_through_route,
         patch(
+            "litellm.proxy.auth.handle_jwt.RouteChecks.allow_auth_true_passthrough_without_allowed_routes",
+            return_value=False,
+        ),
+        patch(
             "litellm.proxy.auth.handle_jwt.RouteChecks.check_passthrough_route_access",
             return_value=False,
         ) as mock_passthrough_check,
@@ -190,6 +194,32 @@ async def test_find_team_with_model_access_reports_passthrough_allowlist_denial(
     user_api_key_dict = mock_passthrough_check.call_args.kwargs["user_api_key_dict"]
     assert user_api_key_dict.metadata == {}
     assert user_api_key_dict.team_metadata == {}
+
+
+def test_team_has_passthrough_route_access_allows_without_allowlist_by_default():
+    team = LiteLLM_TeamTable(team_id="team-a", metadata={})
+
+    with (
+        patch(
+            "litellm.proxy.auth.handle_jwt.RouteChecks.is_auth_enforced_pass_through_route",
+            return_value=True,
+        ) as mock_is_auth_enforced_pass_through_route,
+        patch(
+            "litellm.proxy.auth.handle_jwt.RouteChecks.check_passthrough_route_access",
+            return_value=False,
+        ) as mock_passthrough_check,
+    ):
+        assert (
+            JWTAuthManager._team_has_passthrough_route_access(
+                team_object=team,
+                route="/my-pass-through",
+                request_method="POST",
+            )
+            is True
+        )
+
+    mock_is_auth_enforced_pass_through_route.assert_not_called()
+    mock_passthrough_check.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -231,6 +261,10 @@ async def test_find_team_with_model_access_uses_request_method_for_passthrough_a
         patch(
             "litellm.proxy.pass_through_endpoints.pass_through_endpoints._registered_pass_through_routes",
             mock_registered_routes,
+        ),
+        patch(
+            "litellm.proxy.auth.handle_jwt.RouteChecks.allow_auth_true_passthrough_without_allowed_routes",
+            return_value=False,
         ),
         patch(
             "litellm.proxy.utils.get_server_root_path",
@@ -1958,6 +1992,10 @@ async def test_auth_builder_header_team_denies_auth_passthrough_without_allowlis
             return_value=True,
         ),
         patch(
+            "litellm.proxy.auth.handle_jwt.RouteChecks.allow_auth_true_passthrough_without_allowed_routes",
+            return_value=False,
+        ),
+        patch(
             "litellm.proxy.auth.handle_jwt.RouteChecks.check_passthrough_route_access",
             return_value=False,
         ) as mock_passthrough_check,
@@ -2031,6 +2069,10 @@ async def test_auth_builder_specific_team_denies_auth_passthrough_without_allowl
         patch(
             "litellm.proxy.auth.handle_jwt.RouteChecks.is_auth_enforced_pass_through_route",
             return_value=True,
+        ),
+        patch(
+            "litellm.proxy.auth.handle_jwt.RouteChecks.allow_auth_true_passthrough_without_allowed_routes",
+            return_value=False,
         ),
         patch(
             "litellm.proxy.auth.handle_jwt.RouteChecks.check_passthrough_route_access",
@@ -2114,6 +2156,10 @@ async def test_auth_builder_rbac_team_loads_team_for_passthrough_allowlist():
             return_value=True,
         ),
         patch(
+            "litellm.proxy.auth.handle_jwt.RouteChecks.allow_auth_true_passthrough_without_allowed_routes",
+            return_value=False,
+        ),
+        patch(
             "litellm.proxy.auth.handle_jwt.RouteChecks.check_passthrough_route_access",
             return_value=True,
         ) as mock_passthrough_check,
@@ -2177,6 +2223,10 @@ async def test_auth_builder_rbac_team_denies_passthrough_without_allowlist():
         patch(
             "litellm.proxy.auth.handle_jwt.RouteChecks.is_auth_enforced_pass_through_route",
             return_value=True,
+        ),
+        patch(
+            "litellm.proxy.auth.handle_jwt.RouteChecks.allow_auth_true_passthrough_without_allowed_routes",
+            return_value=False,
         ),
         patch(
             "litellm.proxy.auth.handle_jwt.RouteChecks.check_passthrough_route_access",

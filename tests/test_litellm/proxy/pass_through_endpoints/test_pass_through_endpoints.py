@@ -1741,14 +1741,7 @@ async def test_update_pass_through_endpoint():
 
 
 @pytest.mark.asyncio
-async def test_create_pass_through_endpoint_auth_true_enforces_allowlist():
-    """
-    Regression: a pass-through endpoint created through the management API with
-    auth=true (the model default) must be treated as allowlist-enforced. The
-    create path registers FastAPI routes with dependencies=None, so deriving
-    enforcement from dependency metadata let a key with broad llm_api_routes
-    access call the route without an allowed_passthrough_routes match.
-    """
+async def test_create_pass_through_endpoint_auth_true_records_auth_flag():
     from fastapi import HTTPException
 
     from litellm.proxy._types import (
@@ -1803,14 +1796,28 @@ async def test_create_pass_through_endpoint_auth_true_enforces_allowlist():
         without_allowlist = UserAPIKeyAuth(
             user_id="u", allowed_routes=["llm_api_routes"]
         )
-        with pytest.raises(HTTPException) as exc_info:
+        assert (
             RouteChecks.is_virtual_key_allowed_to_call_route(
                 route="/secure-passthrough",
                 valid_token=without_allowlist,
                 request=post_request,
             )
-        assert exc_info.value.status_code == 403
-        assert "allowed_passthrough_routes" in exc_info.value.detail
+            is True
+        )
+
+        with patch.object(
+            RouteChecks,
+            "allow_auth_true_passthrough_without_allowed_routes",
+            return_value=False,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                RouteChecks.is_virtual_key_allowed_to_call_route(
+                    route="/secure-passthrough",
+                    valid_token=without_allowlist,
+                    request=post_request,
+                )
+            assert exc_info.value.status_code == 403
+            assert "allowed_passthrough_routes" in exc_info.value.detail
 
         with_allowlist = UserAPIKeyAuth(
             user_id="u",
@@ -1828,12 +1835,7 @@ async def test_create_pass_through_endpoint_auth_true_enforces_allowlist():
 
 
 @pytest.mark.asyncio
-async def test_update_pass_through_endpoint_auth_true_enforces_allowlist():
-    """
-    Regression: editing a pass-through endpoint through the management API must
-    keep an auth=true route allowlist-enforced. remove_endpoint_routes drops the
-    old registry entry, so the re-registration has to record the auth flag.
-    """
+async def test_update_pass_through_endpoint_auth_true_records_auth_flag():
     from fastapi import HTTPException
 
     from litellm.proxy._types import (
@@ -1897,14 +1899,28 @@ async def test_update_pass_through_endpoint_auth_true_enforces_allowlist():
         without_allowlist = UserAPIKeyAuth(
             user_id="u", allowed_routes=["llm_api_routes"]
         )
-        with pytest.raises(HTTPException) as exc_info:
+        assert (
             RouteChecks.is_virtual_key_allowed_to_call_route(
                 route="/edited-passthrough",
                 valid_token=without_allowlist,
                 request=post_request,
             )
-        assert exc_info.value.status_code == 403
-        assert "allowed_passthrough_routes" in exc_info.value.detail
+            is True
+        )
+
+        with patch.object(
+            RouteChecks,
+            "allow_auth_true_passthrough_without_allowed_routes",
+            return_value=False,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                RouteChecks.is_virtual_key_allowed_to_call_route(
+                    route="/edited-passthrough",
+                    valid_token=without_allowlist,
+                    request=post_request,
+                )
+            assert exc_info.value.status_code == 403
+            assert "allowed_passthrough_routes" in exc_info.value.detail
 
 
 @pytest.mark.asyncio

@@ -1006,9 +1006,7 @@ def test_virtual_key_llm_api_routes_allows_non_auth_enforced_pass_through_endpoi
         )
 
 
-def test_virtual_key_llm_api_routes_denies_auth_pass_through_without_allowlist():
-    """auth=true pass-through must not be reachable via llm_api_routes alone."""
-
+def test_virtual_key_llm_api_routes_allows_auth_pass_through_without_allowlist_by_default():
     mock_registered_routes = {
         "test-uuid-1:exact:/azure-assistant:GET,POST": {
             "endpoint_id": "test-uuid-1",
@@ -1026,6 +1024,45 @@ def test_virtual_key_llm_api_routes_denies_auth_pass_through_without_allowlist()
         patch(
             "litellm.proxy.utils.get_server_root_path",
             return_value="/",
+        ),
+    ):
+        valid_token = UserAPIKeyAuth(
+            user_id="test_user",
+            allowed_routes=["llm_api_routes"],
+        )
+
+        assert (
+            RouteChecks.is_virtual_key_allowed_to_call_route(
+                route="/azure-assistant",
+                valid_token=valid_token,
+            )
+            is True
+        )
+
+
+def test_virtual_key_llm_api_routes_strict_mode_denies_auth_pass_through_without_allowlist():
+    mock_registered_routes = {
+        "test-uuid-1:exact:/azure-assistant:GET,POST": {
+            "endpoint_id": "test-uuid-1",
+            "path": "/azure-assistant",
+            "type": "exact",
+            "auth": True,
+        },
+    }
+
+    with (
+        patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._registered_pass_through_routes",
+            mock_registered_routes,
+        ),
+        patch(
+            "litellm.proxy.utils.get_server_root_path",
+            return_value="/",
+        ),
+        patch.object(
+            RouteChecks,
+            "allow_auth_true_passthrough_without_allowed_routes",
+            return_value=False,
         ),
     ):
         valid_token = UserAPIKeyAuth(
@@ -1071,6 +1108,11 @@ def test_virtual_key_llm_api_routes_uses_method_specific_auth_setting():
             "litellm.proxy.utils.get_server_root_path",
             return_value="/",
         ),
+        patch.object(
+            RouteChecks,
+            "allow_auth_true_passthrough_without_allowed_routes",
+            return_value=False,
+        ),
     ):
         valid_token = UserAPIKeyAuth(
             user_id="test_user",
@@ -1100,9 +1142,7 @@ def test_virtual_key_llm_api_routes_uses_method_specific_auth_setting():
         assert exc_info.value.status_code == 403
 
 
-def test_non_proxy_admin_denies_auth_pass_through_without_allowlist():
-    """Internal users must not bypass allowed_passthrough_routes via openai_routes."""
-
+def test_non_proxy_admin_allows_auth_pass_through_without_allowlist_by_default():
     mock_registered_routes = {
         "test-uuid-1:exact:/my-pass-through:GET,POST": {
             "endpoint_id": "test-uuid-1",
@@ -1125,6 +1165,47 @@ def test_non_proxy_admin_denies_auth_pass_through_without_allowlist():
         patch(
             "litellm.proxy.utils.get_server_root_path",
             return_value="/",
+        ),
+        patch.object(RouteChecks, "is_llm_api_route", return_value=True),
+    ):
+        RouteChecks.non_proxy_admin_allowed_routes_check(
+            user_obj=None,
+            _user_role=LitellmUserRoles.INTERNAL_USER.value,
+            route="/my-pass-through",
+            request=MagicMock(spec=Request),
+            valid_token=valid_token,
+            request_data={},
+        )
+
+
+def test_non_proxy_admin_strict_mode_denies_auth_pass_through_without_allowlist():
+    mock_registered_routes = {
+        "test-uuid-1:exact:/my-pass-through:GET,POST": {
+            "endpoint_id": "test-uuid-1",
+            "path": "/my-pass-through",
+            "type": "exact",
+            "auth": True,
+        },
+    }
+
+    valid_token = UserAPIKeyAuth(
+        user_id="test_user",
+        user_role=LitellmUserRoles.INTERNAL_USER.value,
+    )
+
+    with (
+        patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._registered_pass_through_routes",
+            mock_registered_routes,
+        ),
+        patch(
+            "litellm.proxy.utils.get_server_root_path",
+            return_value="/",
+        ),
+        patch.object(
+            RouteChecks,
+            "allow_auth_true_passthrough_without_allowed_routes",
+            return_value=False,
         ),
     ):
         with pytest.raises(HTTPException) as exc_info:

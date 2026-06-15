@@ -59,10 +59,15 @@ _PROXY_ADMIN_VIEW_ONLY_BLOCKED_ROUTES: Final = frozenset(
 # paths directly because the request route carries the resolved key id.
 _PROXY_ADMIN_VIEW_ONLY_BLOCKED_KEY_SUFFIXES: Final = ("/regenerate", "/reset_spend")
 
+_ALLOW_AUTH_TRUE_PASSTHROUGH_WITHOUT_ALLOWED_ROUTES = True
 _AUTH_ENFORCED_PASS_THROUGH_ROUTE_GROUPS: Final = frozenset(("openai_routes", "llm_api_routes"))
 
 
 class RouteChecks:
+    @staticmethod
+    def allow_auth_true_passthrough_without_allowed_routes() -> bool:
+        return _ALLOW_AUTH_TRUE_PASSTHROUGH_WITHOUT_ALLOWED_ROUTES
+
     @staticmethod
     def should_call_route(
         route: str,
@@ -103,6 +108,9 @@ class RouteChecks:
         if len(valid_token.allowed_routes) == 0:
             return True
 
+        enforce_auth_true_passthrough_allowed_routes = (
+            not RouteChecks.allow_auth_true_passthrough_without_allowed_routes()
+        )
         denied_auth_enforced_pass_through_route = False
 
         # explicit check for allowed routes (exact match or prefix match)
@@ -119,7 +127,9 @@ class RouteChecks:
                         allowed_routes=LiteLLMRoutes._member_map_[allowed_route].value,
                     ):
                         if (
-                            allowed_route in _AUTH_ENFORCED_PASS_THROUGH_ROUTE_GROUPS
+                            enforce_auth_true_passthrough_allowed_routes
+                            and allowed_route
+                            in _AUTH_ENFORCED_PASS_THROUGH_ROUTE_GROUPS
                             and RouteChecks.is_auth_enforced_pass_through_route(
                                 route=route,
                                 method=RouteChecks._get_request_method(request=request),
@@ -140,9 +150,12 @@ class RouteChecks:
                         )
 
                         if InitPassThroughEndpointHelpers.is_registered_pass_through_route(route=route):
-                            if RouteChecks.is_auth_enforced_pass_through_route(
-                                route=route,
-                                method=RouteChecks._get_request_method(request=request),
+                            if (
+                                enforce_auth_true_passthrough_allowed_routes
+                                and RouteChecks.is_auth_enforced_pass_through_route(
+                                    route=route,
+                                    method=RouteChecks._get_request_method(request=request),
+                                )
                             ):
                                 if RouteChecks.check_passthrough_route_access(
                                     route=route, user_api_key_dict=valid_token
@@ -243,9 +256,12 @@ class RouteChecks:
             route=route,
         )
 
-        if RouteChecks.is_auth_enforced_pass_through_route(
-            route=route,
-            method=RouteChecks._get_request_method(request=request),
+        if (
+            not RouteChecks.allow_auth_true_passthrough_without_allowed_routes()
+            and RouteChecks.is_auth_enforced_pass_through_route(
+                route=route,
+                method=RouteChecks._get_request_method(request=request),
+            )
         ):
             RouteChecks._require_auth_pass_through_access(route=route, valid_token=valid_token)
         elif RouteChecks.is_llm_api_route(route=route):

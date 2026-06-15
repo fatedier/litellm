@@ -1303,6 +1303,9 @@ class JWTAuthManager:
         route: str,
         request_method: str | None = None,
     ) -> bool:
+        if RouteChecks.allow_auth_true_passthrough_without_allowed_routes():
+            return True
+
         normalized_request_method: Final = request_method.upper() if isinstance(request_method, str) else None
         if not RouteChecks.is_auth_enforced_pass_through_route(
             route=route,
@@ -2171,6 +2174,7 @@ class JWTAuthManager:
         if (
             team_id
             and team_object is None
+            and not RouteChecks.allow_auth_true_passthrough_without_allowed_routes()
             and RouteChecks.is_auth_enforced_pass_through_route(
                 route=route,
                 method=(request_method.upper() if isinstance(request_method, str) else None),
