@@ -810,6 +810,52 @@ async def test_async_anthropic_messages_handler_forwards_router_model_info():
 
 
 @pytest.mark.asyncio
+async def test_async_anthropic_messages_handler_passes_cooldown_time_to_litellm_params():
+    handler = BaseLLMHTTPHandler()
+
+    mock_config = Mock()
+    mock_config.validate_anthropic_messages_environment = Mock(
+        return_value=({"x-api-key": "test-key"}, "https://api.anthropic.com")
+    )
+    mock_config.transform_anthropic_messages_request = Mock(
+        return_value={"model": "claude-sonnet-4-20250514", "messages": []}
+    )
+
+    mock_client = AsyncMock()
+    mock_logging_obj = Mock()
+    mock_logging_obj.update_from_kwargs = Mock()
+    mock_logging_obj.model_call_details = {}
+    mock_logging_obj.stream = False
+
+    try:
+        await handler.async_anthropic_messages_handler(
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "Hello"}],
+            anthropic_messages_provider_config=mock_config,
+            anthropic_messages_optional_request_params={},
+            custom_llm_provider="bedrock",
+            litellm_params=GenericLiteLLMParams(),
+            logging_obj=mock_logging_obj,
+            client=mock_client,
+            kwargs={"cooldown_time": 0},
+        )
+    except Exception:
+        pass
+
+    mock_logging_obj.update_from_kwargs.assert_called_once()
+    call_kwargs = mock_logging_obj.update_from_kwargs.call_args
+    litellm_params_arg = (
+        call_kwargs.kwargs.get(
+            "litellm_params", call_kwargs[1].get("litellm_params", {})
+        )
+        if call_kwargs.kwargs
+        else call_kwargs[1].get("litellm_params", {})
+    )
+
+    assert litellm_params_arg["cooldown_time"] == 0
+
+
+@pytest.mark.asyncio
 async def test_async_anthropic_messages_handler_header_priority():
     """
     Test that async_anthropic_messages_handler respects header priority:

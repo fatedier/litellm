@@ -4673,7 +4673,7 @@ class Router:
             return False
         return self._is_invalid_responses_encrypted_content_error(exception)
 
-    async def _ageneric_api_call_with_fallbacks_helper(
+    async def _ageneric_api_call_with_fallbacks_helper(  # noqa: PLR0915
         self, model: str, original_generic_function: Callable, **kwargs
     ):
         """
@@ -4771,6 +4771,9 @@ class Router:
             )
             if model is not None:
                 self.fail_calls[model] += 1
+            if deployment is not None:
+                self._set_deployment_num_retries_on_exception(e, deployment)
+                self._set_failed_deployment_id_on_exception(e, deployment)
             if call_original_generic_function is not None and self._should_retry_responses_without_encrypted_content(
                 original_generic_function=original_generic_function,
                 response_kwargs=response_kwargs,
@@ -4786,8 +4789,17 @@ class Router:
                     verbose_router_logger.info(
                         "ageneric_api_call_with_fallbacks: retrying Responses API request without encrypted content"
                     )
-                    return await call_original_generic_function(stripped_response_kwargs)
+                    try:
+                        return await call_original_generic_function(stripped_response_kwargs)
+                    except Exception as retry_exception:
+                        if deployment is not None:
+                            self._set_deployment_num_retries_on_exception(retry_exception, deployment)
+                            self._stamp_failed_deployment_id_with_effective_model_info(
+                                retry_exception, deployment, kwargs
+                            )
+                        raise retry_exception
             if deployment is not None:
+                self._set_deployment_num_retries_on_exception(e, deployment)
                 self._stamp_failed_deployment_id_with_effective_model_info(e, deployment, kwargs)
             raise e
 
