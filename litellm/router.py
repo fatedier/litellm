@@ -448,6 +448,7 @@ class Router:
         health_check_staleness_threshold: int | None = None,
         health_check_ignore_transient_errors: bool = False,
         enable_weighted_failover: bool = False,
+        retry_responses_without_encrypted_content: bool = False,
     ) -> None:
         """
         Initialize the Router class with the given parameters for caching, reliability, and routing strategy.
@@ -484,6 +485,7 @@ class Router:
             deployment_affinity_ttl_seconds (int): TTL for user-key -> deployment affinity mapping. Defaults to 3600.
             ignore_invalid_deployments (bool): Ignores invalid deployments, and continues with other deployments. Default is to raise an error.
             enable_weighted_failover (bool): When True and the routing strategy is "simple-shuffle", a retryable failure on one deployment causes the request to re-pick (weighted) across the other deployments in the same model group before any cross-group fallback runs. Bounded by `max_fallbacks`. Async-only: currently honored by `router.acompletion()` and other async entrypoints. The sync `router.completion()` path falls back to the regular fallback flow. Defaults to False.
+            retry_responses_without_encrypted_content (bool): When True, async Responses requests that fail with invalid encrypted content are retried once on the same selected deployment after removing Responses encrypted state from the request. Defaults to False.
         Returns:
             Router: An instance of the litellm.Router class.
 
@@ -655,6 +657,7 @@ class Router:
         self.disable_cooldowns = disable_cooldowns
         self.enable_health_check_routing = enable_health_check_routing
         self.enable_weighted_failover = enable_weighted_failover
+        self.retry_responses_without_encrypted_content = retry_responses_without_encrypted_content
         self.health_check_ignore_transient_errors = health_check_ignore_transient_errors
         _staleness: Final = health_check_staleness_threshold or (
             DEFAULT_HEALTH_CHECK_INTERVAL * DEFAULT_HEALTH_CHECK_STALENESS_MULTIPLIER
@@ -4637,7 +4640,42 @@ class Router:
             kwargs["endpoint"] = kwargs["endpoint"].replace(model, replacement_model_name)
         return kwargs
 
-    async def _ageneric_api_call_with_fallbacks_helper(self, model: str, original_generic_function: Callable, **kwargs):
+    @staticmethod
+    def _is_responses_api_function(original_generic_function: Callable) -> bool:
+        return getattr(original_generic_function, "__name__", "") == "aresponses"
+
+    @staticmethod
+    def _is_invalid_responses_encrypted_content_error(exception: Exception) -> bool:
+        status_code = getattr(exception, "status_code", None)
+        if status_code is not None and status_code != 400:
+            return False
+
+        error_message = str(exception).lower()
+        return (
+            "invalid_encrypted_content" in error_message
+            or "encrypted_content" in error_message
+            or "encrypted content" in error_message
+        )
+
+    def _should_retry_responses_without_encrypted_content(
+        self,
+        original_generic_function: Callable,
+        response_kwargs: dict[str, Any] | None,
+        exception: Exception,
+    ) -> bool:
+        if not getattr(self, "retry_responses_without_encrypted_content", False):
+            return False
+        if response_kwargs is None:
+            return False
+        if response_kwargs.get("_responses_encrypted_content_stripped_retry") is True:
+            return False
+        if not self._is_responses_api_function(original_generic_function):
+            return False
+        return self._is_invalid_responses_encrypted_content_error(exception)
+
+    async def _ageneric_api_call_with_fallbacks_helper(
+        self, model: str, original_generic_function: Callable, **kwargs
+    ):
         """
         Helper function to make a generic LLM API call through the router, this allows you to use retries/fallbacks with litellm router
         """
@@ -4645,6 +4683,8 @@ class Router:
         passthrough_on_no_deployment: Final = kwargs.pop("passthrough_on_no_deployment", False)
         function_name: Final = "_ageneric_api_call_with_fallbacks"
         deployment = None  # rebind-ok: pre-init so the except block can stamp a failure with no deployment picked
+        response_kwargs: dict[str, Any] | None = None
+        call_original_generic_function: Callable | None = None
         try:
             parent_otel_span: Final = _get_parent_otel_span_from_kwargs(kwargs)
             try:
@@ -4681,7 +4721,7 @@ class Router:
             except Exception:
                 custom_llm_provider = None
 
-            response_kwargs: Final = {
+            response_kwargs = {
                 **data,
                 "caching": self.cache_responses,
                 **kwargs,
@@ -4691,29 +4731,35 @@ class Router:
             if custom_llm_provider is not None:
                 response_kwargs["custom_llm_provider"] = custom_llm_provider
 
-            response = original_generic_function(**response_kwargs)
+            async def _call_original_generic_function(
+                call_kwargs: dict[str, Any],
+            ) -> Any:
+                response = original_generic_function(**call_kwargs)
 
-            rpm_semaphore: Final = self._get_client(
-                deployment=deployment,
-                kwargs=kwargs,
-                client_type="max_parallel_requests",
-            )
+                rpm_semaphore: Final = self._get_client(
+                    deployment=deployment,
+                    kwargs=kwargs,
+                    client_type="max_parallel_requests",
+                )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
-                async with rpm_semaphore:
-                    """
-                    - Check rpm limits before making the call
-                    - If allowed, increment the rpm limit (allows global value to be updated, concurrency-safe)
-                    """
+                if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
+                    async with rpm_semaphore:
+                        """
+                        - Check rpm limits before making the call
+                        - If allowed, increment the rpm limit (allows global value to be updated, concurrency-safe)
+                        """
+                        await self.async_routing_strategy_pre_call_checks(
+                            deployment=deployment, parent_otel_span=parent_otel_span
+                        )
+                        return await response  # type: ignore
+                else:
                     await self.async_routing_strategy_pre_call_checks(
                         deployment=deployment, parent_otel_span=parent_otel_span
                     )
-                    response = await response
-            else:
-                await self.async_routing_strategy_pre_call_checks(
-                    deployment=deployment, parent_otel_span=parent_otel_span
-                )
-                response = await response
+                    return await response  # type: ignore
+
+            call_original_generic_function = _call_original_generic_function
+            response = await call_original_generic_function(response_kwargs)
 
             self.success_calls[model_name] += 1
             verbose_router_logger.info("ageneric_api_call_with_fallbacks(model=%s)\x1b[32m 200 OK\x1b[0m", model_name)
@@ -4725,6 +4771,22 @@ class Router:
             )
             if model is not None:
                 self.fail_calls[model] += 1
+            if call_original_generic_function is not None and self._should_retry_responses_without_encrypted_content(
+                original_generic_function=original_generic_function,
+                response_kwargs=response_kwargs,
+                exception=e,
+            ):
+                from litellm.responses.utils import ResponsesAPIRequestUtils
+
+                stripped_response_kwargs, did_strip = (
+                    ResponsesAPIRequestUtils.strip_encrypted_content_from_request_kwargs_for_retry(response_kwargs)
+                )
+                if did_strip:
+                    stripped_response_kwargs["_responses_encrypted_content_stripped_retry"] = True
+                    verbose_router_logger.info(
+                        "ageneric_api_call_with_fallbacks: retrying Responses API request without encrypted content"
+                    )
+                    return await call_original_generic_function(stripped_response_kwargs)
             if deployment is not None:
                 self._stamp_failed_deployment_id_with_effective_model_info(e, deployment, kwargs)
             raise e
@@ -10343,6 +10405,7 @@ class Router:
             "enable_weighted_failover",
             "enable_tag_filtering",
             "tag_routing_prefix",
+            "retry_responses_without_encrypted_content",
         ]
 
         for var in vars_to_include:
@@ -10381,6 +10444,7 @@ class Router:
             "enable_weighted_failover",
             "enable_tag_filtering",
             "tag_routing_prefix",
+            "retry_responses_without_encrypted_content",
         ]
 
         _int_settings: Final = [

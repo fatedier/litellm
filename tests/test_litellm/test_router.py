@@ -1298,6 +1298,198 @@ async def test_ageneric_api_call_deployment_model_overrides_alias():
     ), f"Expected deployment model 'vertex_ai/gemini-2.5-flash', got '{captured['model']}'"
 
 
+@pytest.mark.asyncio
+async def test_router_responses_invalid_encrypted_content_retry_strips_state():
+    from litellm.responses.utils import ResponsesAPIRequestUtils
+
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "responses-model",
+                "litellm_params": {
+                    "model": "gpt-4o",
+                    "api_key": "test-key",
+                    "api_base": "https://region-a.example/v1",
+                },
+                "model_info": {"id": "deployment-a"},
+            }
+        ],
+        retry_responses_without_encrypted_content=True,
+    )
+    deployment = {
+        "model_name": "responses-model",
+        "litellm_params": {
+            "model": "gpt-4o",
+            "api_key": "test-key",
+            "api_base": "https://region-a.example/v1",
+        },
+        "model_info": {"id": "deployment-a"},
+    }
+    calls = []
+
+    async def aresponses(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise litellm.BadRequestError(
+                message="invalid_encrypted_content: The encrypted content could not be verified.",
+                model=kwargs.get("model"),
+                llm_provider="openai",
+            )
+        return {"result": "ok"}
+
+    request_input = [
+        {
+            "type": "reasoning",
+            "id": "rs_123",
+            "encrypted_content": "stale-provider-state",
+        },
+        {
+            "type": "reasoning",
+            "id": ResponsesAPIRequestUtils._build_encrypted_item_id(
+                model_id="deployment-a",
+                item_id="rs_456",
+            ),
+        },
+        {"role": "user", "content": "continue"},
+    ]
+    original_input = copy.deepcopy(request_input)
+
+    with patch.object(
+        router,
+        "async_get_available_deployment",
+        new=AsyncMock(return_value=deployment),
+    ) as mock_get_deployment:
+        with patch.object(router, "_update_kwargs_with_deployment"):
+            with patch.object(router, "_get_client", return_value=None):
+                with patch.object(
+                    router,
+                    "async_routing_strategy_pre_call_checks",
+                    new=AsyncMock(return_value=None),
+                ) as mock_pre_call_checks:
+                    result = await router._ageneric_api_call_with_fallbacks_helper(
+                        model="responses-model",
+                        original_generic_function=aresponses,
+                        input=request_input,
+                        previous_response_id="resp_previous",
+                        include=["reasoning.encrypted_content"],
+                    )
+
+    assert result == {"result": "ok"}
+    assert len(calls) == 2
+    mock_get_deployment.assert_called_once()
+    assert mock_pre_call_checks.call_count == 2
+
+    first_call = calls[0]
+    retry_call = calls[1]
+    assert first_call["model"] == "gpt-4o"
+    assert retry_call["model"] == "gpt-4o"
+    assert retry_call["api_base"] == "https://region-a.example/v1"
+    assert first_call["previous_response_id"] == "resp_previous"
+    assert "previous_response_id" not in retry_call
+    assert retry_call["input"] == [
+        {
+            "type": "reasoning",
+            "id": ResponsesAPIRequestUtils._build_encrypted_item_id(
+                model_id="deployment-a",
+                item_id="rs_456",
+            ),
+        },
+        {"role": "user", "content": "continue"},
+    ]
+    assert retry_call["include"] == ["reasoning.encrypted_content"]
+    assert retry_call["_responses_encrypted_content_stripped_retry"] is True
+    assert request_input == original_input
+
+
+@pytest.mark.asyncio
+async def test_router_responses_invalid_encrypted_content_retry_is_default_off():
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "responses-model",
+                "litellm_params": {"model": "gpt-4o", "api_key": "test-key"},
+            }
+        ],
+    )
+    deployment = {
+        "model_name": "responses-model",
+        "litellm_params": {"model": "gpt-4o", "api_key": "test-key"},
+    }
+    calls = []
+
+    async def aresponses(**kwargs):
+        calls.append(kwargs)
+        raise litellm.BadRequestError(
+            message="invalid_encrypted_content",
+            model=kwargs.get("model"),
+            llm_provider="openai",
+        )
+
+    with patch.object(
+        router,
+        "async_get_available_deployment",
+        new=AsyncMock(return_value=deployment),
+    ):
+        with patch.object(router, "_update_kwargs_with_deployment"):
+            with patch.object(router, "_get_client", return_value=None):
+                with patch.object(
+                    router,
+                    "async_routing_strategy_pre_call_checks",
+                    new=AsyncMock(return_value=None),
+                ):
+                    with pytest.raises(litellm.BadRequestError):
+                        await router._ageneric_api_call_with_fallbacks_helper(
+                            model="responses-model",
+                            original_generic_function=aresponses,
+                            input=[
+                                {
+                                    "type": "reasoning",
+                                    "encrypted_content": "stale-provider-state",
+                                }
+                            ],
+                            previous_response_id="resp_previous",
+                        )
+
+    assert len(calls) == 1
+
+
+def test_router_responses_encrypted_content_error_detection_is_specific():
+    invalid_encrypted_content_error = litellm.BadRequestError(
+        message="invalid_encrypted_content",
+        model="gpt-4o",
+        llm_provider="openai",
+    )
+    encrypted_content_error_without_code = litellm.BadRequestError(
+        message="The encrypted content for item rs_123 could not be verified.",
+        model="gpt-4o",
+        llm_provider="openai",
+    )
+    unrelated_verification_error = litellm.BadRequestError(
+        message="The request signature could not be verified.",
+        model="gpt-4o",
+        llm_provider="openai",
+    )
+
+    assert (
+        litellm.Router._is_invalid_responses_encrypted_content_error(
+            invalid_encrypted_content_error
+        )
+        is True
+    )
+    assert (
+        litellm.Router._is_invalid_responses_encrypted_content_error(
+            encrypted_content_error_without_code
+        )
+        is True
+    )
+    assert (
+        litellm.Router._is_invalid_responses_encrypted_content_error(
+            unrelated_verification_error
+        )
+        is False
+    )
+
+
 def test_router_get_model_access_groups_team_only_models():
     """
     Test that Router.get_model_access_groups returns the correct response for team-only models

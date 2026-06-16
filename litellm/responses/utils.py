@@ -492,6 +492,54 @@ class ResponsesAPIRequestUtils:
         return request_input
 
     @staticmethod
+    def strip_encrypted_content_from_request_kwargs_for_retry(
+        request_kwargs: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Return request kwargs that can retry without Responses encrypted state.
+
+        The degraded retry must avoid forwarding stale provider-owned state. For
+        Responses API that state can be represented by ``previous_response_id``
+        and by top-level input items carrying ``encrypted_content``.
+        """
+        stripped_kwargs = request_kwargs.copy()
+        did_strip = False
+
+        if stripped_kwargs.pop("previous_response_id", None) is not None:
+            did_strip = True
+
+        if "input" in stripped_kwargs:
+            stripped_input, stripped_input_changed = ResponsesAPIRequestUtils._strip_encrypted_content_items_from_input(
+                stripped_kwargs["input"]
+            )
+            if stripped_input_changed:
+                stripped_kwargs["input"] = stripped_input
+                did_strip = True
+
+        return stripped_kwargs, did_strip
+
+    @staticmethod
+    def _strip_encrypted_content_items_from_input(
+        request_input: Any,
+    ) -> tuple[Any, bool]:
+        if not isinstance(request_input, list):
+            return request_input, False
+
+        stripped_input: list[Any] = []
+        did_strip = False
+
+        for item in request_input:
+            if isinstance(item, dict) and "encrypted_content" in item:
+                did_strip = True
+                continue
+
+            if isinstance(item, dict):
+                stripped_input.append(item.copy())
+            else:
+                stripped_input.append(item)
+
+        return stripped_input, did_strip
+
+    @staticmethod
     def _build_responses_api_response_id(
         custom_llm_provider: str | None,
         model_id: str | None,

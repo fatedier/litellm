@@ -5,7 +5,7 @@ litellm.Router Types - includes RouterConfig, UpdateRouterConfig, ModelInfo etc
 import datetime
 import enum
 from dataclasses import dataclass
-from typing import Any, ClassVar, Final, Generic, Literal, TypeVar, get_type_hints
+from typing import Any, ClassVar, Final, Generic, Literal, Optional, TypeVar, get_type_hints
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -75,6 +75,7 @@ class RouterConfig(BaseModel):
     context_window_fallbacks: list | None = []
     model_group_alias: dict[str, list[str]] | None = {}
     retry_after: int | None = 0
+    retry_responses_without_encrypted_content: Optional[bool] = False
     routing_strategy: Literal[
         "simple-shuffle",
         "least-busy",
@@ -124,6 +125,7 @@ class UpdateRouterConfig(BaseModel):
     model_group_alias: dict[str, str | dict] | None = {}
     enable_tag_filtering: bool | None = None
     tag_routing_prefix: str | None = None
+    retry_responses_without_encrypted_content: Optional[bool] = None
 
     model_config = ConfigDict(protected_namespaces=())
 
