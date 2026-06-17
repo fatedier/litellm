@@ -2683,6 +2683,67 @@ class TestHandleLLMApiExceptionDictDetail:
             return raised
         raise AssertionError("ProxyException was not raised")
 
+    async def test_failure_logging_receives_call_type(self):
+        from litellm.proxy._types import ProxyException, UserAPIKeyAuth
+
+        processor = ProxyBaseLLMRequestProcessing(data={"call_type": "acompletion"})
+        processor._failure_call_type = "aresponses"
+        user_api_key_dict = UserAPIKeyAuth(api_key="sk-test")
+        proxy_logging_obj = MagicMock()
+        proxy_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+        proxy_logging_obj.post_call_response_headers_hook = AsyncMock(return_value={})
+
+        with pytest.raises(ProxyException):
+            await processor._handle_llm_api_exception(
+                e=Exception("provider failed"),
+                user_api_key_dict=user_api_key_dict,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+        request_data = proxy_logging_obj.post_call_failure_hook.call_args.kwargs[
+            "request_data"
+        ]
+        assert request_data["call_type"] == "aresponses"
+
+    async def test_direct_pre_call_failure_logging_receives_call_type(self):
+        from litellm.proxy._types import ProxyException, UserAPIKeyAuth
+
+        processor = ProxyBaseLLMRequestProcessing(data={"model": "test-model"})
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        user_api_key_dict = UserAPIKeyAuth(api_key="sk-test")
+        proxy_logging_obj = MagicMock()
+        proxy_logging_obj.pre_call_hook = AsyncMock(side_effect=Exception("pre-call"))
+        proxy_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+        proxy_logging_obj.post_call_response_headers_hook = AsyncMock(return_value={})
+        proxy_config = MagicMock(spec=ProxyConfig)
+
+        with patch(
+            "litellm.proxy.common_request_processing.add_litellm_data_to_request",
+            new=AsyncMock(return_value={"model": "test-model"}),
+        ):
+            with pytest.raises(Exception, match="pre-call") as exc_info:
+                await processor.common_processing_pre_call_logic(
+                    request=mock_request,
+                    general_settings={},
+                    user_api_key_dict=user_api_key_dict,
+                    proxy_logging_obj=proxy_logging_obj,
+                    proxy_config=proxy_config,
+                    route_type="aresponses",
+                )
+
+        with pytest.raises(ProxyException):
+            await processor._handle_llm_api_exception(
+                e=exc_info.value,
+                user_api_key_dict=user_api_key_dict,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+        request_data = proxy_logging_obj.post_call_failure_hook.call_args.kwargs[
+            "request_data"
+        ]
+        assert request_data["call_type"] == "aresponses"
+
     async def test_dict_detail_bedrock_shape_preserved(self):
         exc = HTTPException(
             status_code=400,

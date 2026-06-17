@@ -133,23 +133,20 @@ class _ProxyDBLogger(CustomLogger):
             metadata=_metadata,
         )
 
-        existing_metadata: Final[dict] = request_data.get("metadata", None) or {}
-        existing_metadata.update(_metadata)
-
         if "litellm_params" not in request_data:
             request_data["litellm_params"] = {}
 
         existing_litellm_params: Final = request_data.get("litellm_params", {})
-        existing_litellm_metadata: Final = existing_litellm_params.get("metadata", {}) or {}
-
-        # Preserve tags from existing metadata
-        if existing_litellm_metadata.get("tags"):
-            existing_metadata["tags"] = existing_litellm_metadata.get("tags")
+        existing_metadata: Final = _ProxyDBLogger._get_merged_failure_metadata(
+            request_data=request_data,
+            failure_metadata=_metadata,
+        )
 
         request_data["litellm_params"]["proxy_server_request"] = (
             request_data.get("proxy_server_request") or existing_litellm_params.get("proxy_server_request") or {}
         )
         request_data["litellm_params"]["metadata"] = existing_metadata
+        request_data["litellm_params"]["litellm_metadata"] = existing_metadata
 
         # Preserve model name and custom_llm_provider
         if "model" not in request_data:
@@ -202,6 +199,41 @@ class _ProxyDBLogger(CustomLogger):
             end_time=datetime.now(),
             org_id=user_api_key_dict.org_id,
         )
+
+    @staticmethod
+    def _get_merged_failure_metadata(
+        request_data: dict,
+        failure_metadata: dict,
+    ) -> dict:
+        merged_metadata: dict = {}
+        existing_litellm_params = request_data.get("litellm_params", {}) or {}
+        metadata = request_data.get("metadata", {}) or {}
+        litellm_metadata = request_data.get("litellm_metadata", {}) or {}
+        proxy_server_request = request_data.get("proxy_server_request", {}) or {}
+        trusted_metadata_key = proxy_server_request.get("metadata_variable_name")
+        if trusted_metadata_key not in ("metadata", "litellm_metadata"):
+            trusted_metadata_key = "metadata"
+        trusted_top_level_metadata = (
+            litellm_metadata if trusted_metadata_key == "litellm_metadata" else metadata
+        )
+
+        def merge_metadata(metadata_value: Any, overwrite: bool) -> None:
+            if not isinstance(metadata_value, dict):
+                return
+            for key, value in metadata_value.items():
+                if value in (None, "", {}):
+                    continue
+                if not overwrite and key in merged_metadata:
+                    continue
+                merged_metadata[key] = value
+
+        merge_metadata(trusted_top_level_metadata, overwrite=True)
+        merge_metadata(existing_litellm_params.get("metadata", {}) or {}, False)
+        merge_metadata(existing_litellm_params.get("litellm_metadata", {}) or {}, False)
+
+        for key, value in failure_metadata.items():
+            merged_metadata[key] = value
+        return merged_metadata
 
     @log_db_metrics
     async def _PROXY_track_cost_callback(
