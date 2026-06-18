@@ -3275,6 +3275,58 @@ class Router:
         if "tool_choice" not in kwargs and dep_params.get("tool_choice") is not None:
             kwargs["tool_choice"] = dep_params["tool_choice"]
 
+    @staticmethod
+    def _merge_forwarded_client_headers_from_deployment(deployment: dict, kwargs: dict) -> None:
+        litellm_params_raw = deployment.get("litellm_params", {}) or {}
+        if isinstance(litellm_params_raw, dict):
+            litellm_params = litellm_params_raw
+        else:
+            litellm_params = litellm_params_raw.model_dump(exclude_none=True)
+        header_allowlist = litellm_params.get("forward_client_headers")
+        if not isinstance(header_allowlist, list) or not header_allowlist:
+            return
+
+        proxy_server_request = kwargs.get("proxy_server_request") or {}
+        request_headers = proxy_server_request.get("headers") or {}
+        if not isinstance(request_headers, dict):
+            return
+
+        request_headers_by_lower = {
+            str(header).lower(): (header, value)
+            for header, value in request_headers.items()
+            if header is not None and value is not None
+        }
+        forwarded_headers = {}
+        for header_name in header_allowlist:
+            if not isinstance(header_name, str):
+                continue
+            request_header = request_headers_by_lower.get(header_name.lower())
+            if request_header is None:
+                continue
+            original_header_name, value = request_header
+            forwarded_headers[str(original_header_name)] = str(value)
+
+        if not forwarded_headers:
+            return
+
+        deployment_extra_headers = litellm_params.get("extra_headers") or {}
+        if not isinstance(deployment_extra_headers, dict):
+            deployment_extra_headers = {}
+        request_extra_headers = kwargs.get("extra_headers") or {}
+        if not isinstance(request_extra_headers, dict):
+            request_extra_headers = {}
+        forwarded_header_names = {header.lower() for header in forwarded_headers}
+        merged_extra_headers = {
+            header: value
+            for header, value in {
+                **deployment_extra_headers,
+                **request_extra_headers,
+            }.items()
+            if str(header).lower() not in forwarded_header_names
+        }
+        merged_extra_headers.update(forwarded_headers)
+        kwargs["extra_headers"] = merged_extra_headers
+
     def _update_kwargs_with_deployment(
         self,
         deployment: dict,
@@ -3288,6 +3340,7 @@ class Router:
         - Merges tools from deployment with request (proxy-configured tools + request tools).
         """
         self._merge_tools_from_deployment(deployment=deployment, kwargs=kwargs)
+        self._merge_forwarded_client_headers_from_deployment(deployment=deployment, kwargs=kwargs)
 
         model_info = deployment.get("model_info", {}).copy()
         deployment_litellm_model_name = deployment["litellm_params"]["model"]

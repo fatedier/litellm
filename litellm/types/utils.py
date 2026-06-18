@@ -3431,6 +3431,7 @@ all_litellm_params = (
         "litellm_request_debug",
         "guardrails",
         "tags",
+        "forward_client_headers",
         "acompletion",
         "aimg_generation",
         "atext_completion",

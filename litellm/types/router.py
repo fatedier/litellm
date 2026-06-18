@@ -339,6 +339,7 @@ class GenericLiteLLMParams(CredentialLiteLLMParams, CustomPricingLiteLLMParams):
     tags: list[str] | None = None
     # regex patterns matched against request headers for tag routing
     tag_regex: list[str] | None = None
+    forward_client_headers: list[str] | None = None
 
     # auto-router params
     auto_router_config_path: str | None = None
@@ -495,6 +496,7 @@ class LiteLLMParamsTypedDict(TypedDict, total=False):
     tags: list[str] | None
     # regex patterns matched against request headers (e.g. "^User-Agent:\\s*claude-code\\/")
     tag_regex: list[str] | None
+    forward_client_headers: list[str] | None
 
     # deployment budgets
     max_budget: float | None

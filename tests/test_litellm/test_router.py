@@ -16,6 +16,7 @@ sys.path.insert(
 import litellm
 from litellm.exceptions import MidStreamFallbackError
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.types.router import LiteLLM_Params
 
 
 def test_update_kwargs_does_not_mutate_defaults_and_merges_metadata():
@@ -56,6 +57,117 @@ def test_update_kwargs_does_not_mutate_defaults_and_merges_metadata():
 
     # 3) metadata lands under "metadata"
     assert kwargs["litellm_metadata"] == {"baz": 123}
+
+
+def test_update_kwargs_with_deployment_forwards_allowlisted_client_headers():
+    router = litellm.Router(model_list=[])
+    deployment = {
+        "model_name": "gpt-4",
+        "litellm_params": {
+            "model": "openai/gpt-4",
+            "api_key": "test-key",
+            "forward_client_headers": ["user-agent"],
+        },
+        "model_info": {"id": "deployment-id"},
+    }
+    kwargs = {
+        "proxy_server_request": {
+            "headers": {
+                "User-Agent": "codex-cli/1.2.3",
+                "X-Request-ID": "request-id",
+            }
+        }
+    }
+
+    router._update_kwargs_with_deployment(deployment=deployment, kwargs=kwargs)
+
+    assert kwargs["extra_headers"] == {"User-Agent": "codex-cli/1.2.3"}
+
+
+def test_update_kwargs_with_deployment_merges_forwarded_headers_with_extra_headers():
+    router = litellm.Router(model_list=[])
+    deployment = {
+        "model_name": "gpt-4",
+        "litellm_params": {
+            "model": "openai/gpt-4",
+            "api_key": "test-key",
+            "extra_headers": {
+                "X-Provider-Required": "keep-me",
+            },
+            "forward_client_headers": ["user-agent", "x-client-version"],
+        },
+        "model_info": {"id": "deployment-id"},
+    }
+    kwargs = {
+        "extra_headers": {
+            "User-Agent": "static-user-agent",
+            "X-Static": "static",
+        },
+        "proxy_server_request": {
+            "headers": {
+                "user-agent": "codex-cli/1.2.3",
+                "X-Client-Version": "2026.06",
+            }
+        },
+    }
+
+    router._update_kwargs_with_deployment(deployment=deployment, kwargs=kwargs)
+
+    assert kwargs["extra_headers"] == {
+        "X-Provider-Required": "keep-me",
+        "X-Static": "static",
+        "user-agent": "codex-cli/1.2.3",
+        "X-Client-Version": "2026.06",
+    }
+
+
+def test_update_kwargs_with_deployment_does_not_forward_without_allowlist():
+    router = litellm.Router(model_list=[])
+    deployment = {
+        "model_name": "gpt-4",
+        "litellm_params": {
+            "model": "openai/gpt-4",
+            "api_key": "test-key",
+        },
+        "model_info": {"id": "deployment-id"},
+    }
+    kwargs = {
+        "proxy_server_request": {
+            "headers": {
+                "User-Agent": "codex-cli/1.2.3",
+            }
+        }
+    }
+
+    router._update_kwargs_with_deployment(deployment=deployment, kwargs=kwargs)
+
+    assert "extra_headers" not in kwargs
+
+
+def test_update_kwargs_with_deployment_forwards_headers_from_pydantic_params():
+    router = litellm.Router(model_list=[])
+    deployment = {
+        "model_name": "gpt-4",
+        "litellm_params": LiteLLM_Params(
+            model="openai/gpt-4",
+            api_key="test-key",
+            forward_client_headers=["user-agent"],
+        ),
+        "model_info": {"id": "deployment-id"},
+    }
+    kwargs = {
+        "proxy_server_request": {
+            "headers": {
+                "User-Agent": "codex-cli/1.2.3",
+            }
+        }
+    }
+
+    router._merge_forwarded_client_headers_from_deployment(
+        deployment=deployment, kwargs=kwargs
+    )
+
+    assert kwargs["extra_headers"] == {"User-Agent": "codex-cli/1.2.3"}
 
 
 def test_router_with_model_info_and_model_group():
