@@ -31,6 +31,7 @@ from litellm.constants import (
     UNSAFE_PROXY_RESPONSE_HEADERS,
 )
 from litellm.integrations.custom_guardrail import CustomGuardrail
+from litellm.integrations.websearch_interception.tools import is_web_search_tool
 from litellm.litellm_core_utils.dd_tracing import NullTracer, tracer
 from litellm.litellm_core_utils.get_supported_openai_params import (
     get_supported_openai_params,
@@ -86,6 +87,7 @@ from litellm.types.utils import (
 # the per-chunk hot path can skip the context manager entirely when tracing
 # is off (the default).
 _DD_STREAMING_TRACE_ENABLED: Final = not isinstance(tracer, NullTracer)
+_ANTHROPIC_CONTEXT_1M_BETA_HEADER = "context-1m-2025-08-07"
 
 
 _CLIENT_DISCONNECTED_ERROR_INFORMATION: Final[StandardLoggingPayloadErrorInformation] = {
@@ -408,6 +410,108 @@ def _collect_response_file_search_vector_store_ids(data: Mapping[str, object]) -
             vector_store_ids.add(vector_store_id)
 
     return vector_store_ids
+
+
+def _is_pure_web_search_request(data: dict[str, Any]) -> bool:
+    tools = data.get("tools")
+    if not isinstance(tools, list) or len(tools) == 0:
+        return False
+
+    return all(isinstance(tool, dict) and is_web_search_tool(tool) for tool in tools)
+
+
+def _resolve_websearch_redirect_model(data: dict[str, Any], llm_router: Router | None) -> str | None:
+    """
+    Resolve the model-group redirect target for pure web-search requests.
+
+    This is intentionally evaluated before Router routing. The setting is a
+    model-group redirect rule, not a selected-deployment hook.
+    """
+    requested_model = data.get("model")
+    if not isinstance(requested_model, str) or llm_router is None or not _is_pure_web_search_request(data):
+        return None
+
+    metadata = data.get("metadata") or {}
+    litellm_metadata = data.get("litellm_metadata") or {}
+    request_team_id = metadata.get("user_api_key_team_id") or litellm_metadata.get("user_api_key_team_id")
+
+    for deployment in llm_router.get_model_list(model_name=requested_model, team_id=request_team_id) or []:
+        litellm_params = deployment.get("litellm_params", {})
+        if not isinstance(litellm_params, dict):
+            continue
+
+        redirect_model = litellm_params.get("websearch_redirect_model")
+        if isinstance(redirect_model, str) and redirect_model:
+            return redirect_model
+
+    return None
+
+
+def _apply_websearch_redirect_model(data: dict[str, Any], llm_router: Router | None) -> bool:
+    redirect_model = _resolve_websearch_redirect_model(
+        data=data,
+        llm_router=llm_router,
+    )
+    if redirect_model is None:
+        return False
+
+    data["model"] = redirect_model
+    return True
+
+
+def _is_claude_haiku_4_5_model(model: Any) -> bool:
+    return isinstance(model, str) and "claude-haiku-4-5" in model.lower()
+
+
+def _filter_anthropic_beta_header_value(value: Any) -> Any | None:
+    if isinstance(value, str):
+        beta_values = [beta.strip() for beta in value.split(",") if beta.strip()]
+        filtered_values = [beta for beta in beta_values if beta != _ANTHROPIC_CONTEXT_1M_BETA_HEADER]
+        if not filtered_values:
+            return None
+        return ",".join(filtered_values)
+
+    if isinstance(value, list):
+        filtered_values = [beta for beta in value if str(beta).strip() != _ANTHROPIC_CONTEXT_1M_BETA_HEADER]
+        if not filtered_values:
+            return None
+        return filtered_values
+
+    return value
+
+
+def _sanitize_haiku_4_5_provider_specific_headers(data: dict[str, Any]) -> None:
+    provider_specific_header = data.get("provider_specific_header")
+    if not isinstance(provider_specific_header, dict):
+        return
+
+    extra_headers = provider_specific_header.get("extra_headers")
+    if not isinstance(extra_headers, dict):
+        return
+
+    for header, value in list(extra_headers.items()):
+        if str(header).lower() != "anthropic-beta":
+            continue
+        filtered_value = _filter_anthropic_beta_header_value(value)
+        if filtered_value is None:
+            extra_headers.pop(header, None)
+        else:
+            extra_headers[header] = filtered_value
+
+    if extra_headers:
+        provider_specific_header["extra_headers"] = extra_headers
+    else:
+        data.pop("provider_specific_header", None)
+
+
+def _sanitize_websearch_redirected_haiku_4_5_request(data: dict[str, Any], websearch_redirect_applied: bool) -> None:
+    if not websearch_redirect_applied or not _is_claude_haiku_4_5_model(data.get("model")):
+        return
+
+    _sanitize_haiku_4_5_provider_specific_headers(data)
+    data.pop("context_management", None)
+    data.pop("thinking", None)
+    data.pop("output_config", None)
 
 
 async def _authorize_response_file_search_vector_stores(
@@ -1468,6 +1572,11 @@ class ProxyBaseLLMRequestProcessing:
                 )
                 if alias_target is not None:
                     self.data["model"] = alias_target
+        websearch_redirect_applied = _apply_websearch_redirect_model(
+            data=self.data,
+            llm_router=llm_router,
+        )
+        _sanitize_websearch_redirected_haiku_4_5_request(self.data, websearch_redirect_applied)
 
         self.data["litellm_call_id"] = request.headers.get("x-litellm-call-id", str(uuid.uuid4()))
         DDSpanTagger.tag_call_id(self.data.get("litellm_call_id"))

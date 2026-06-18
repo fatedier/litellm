@@ -33,12 +33,349 @@ from litellm.proxy.common_request_processing import (
     _resolve_per_request_model_group_alias,
     _should_return_raw_model_name,
     _UpstreamClosingStreamingResponse,
+    _resolve_websearch_redirect_model,
+    _sanitize_websearch_redirected_haiku_4_5_request,
     create_response,
 )
 from litellm.proxy.dd_span_tagger import DDSpanTagger
 from litellm.proxy._types import ProxyException
 from litellm.proxy._types import UserAPIKeyAuth as ProxyUserAPIKeyAuth
 from litellm.proxy.utils import ProxyLogging
+from litellm.types.utils import all_litellm_params
+from litellm.utils import get_non_default_completion_params
+
+
+WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
+REGULAR_TOOL = {
+    "type": "custom",
+    "name": "read_file",
+    "description": "Read a file",
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+
+def _make_router_with_deployments(deployments):
+    router = MagicMock()
+    router.get_model_list.return_value = deployments
+    return router
+
+
+class TestWebsearchRedirectModel:
+    def test_should_resolve_redirect_model_for_pure_websearch_request(self):
+        router = _make_router_with_deployments(
+            [
+                {
+                    "litellm_params": {
+                        "model": "bedrock/converse/anthropic.claude-sonnet",
+                        "websearch_redirect_model": "claude-haiku-web-search",
+                    }
+                },
+                {"litellm_params": {"model": "vertex_ai/claude-sonnet"}},
+            ]
+        )
+        data = {"model": "claude-code", "tools": [WEB_SEARCH_TOOL]}
+
+        result = _resolve_websearch_redirect_model(data=data, llm_router=router)
+
+        assert result == "claude-haiku-web-search"
+        router.get_model_list.assert_called_once_with(
+            model_name="claude-code", team_id=None
+        )
+
+    def test_should_not_resolve_redirect_model_for_mixed_tools_request(self):
+        router = _make_router_with_deployments(
+            [
+                {
+                    "litellm_params": {
+                        "model": "bedrock/converse/anthropic.claude-sonnet",
+                        "websearch_redirect_model": "claude-haiku-web-search",
+                    }
+                }
+            ]
+        )
+        data = {"model": "claude-code", "tools": [WEB_SEARCH_TOOL, REGULAR_TOOL]}
+
+        result = _resolve_websearch_redirect_model(data=data, llm_router=router)
+
+        assert result is None
+        router.get_model_list.assert_not_called()
+
+    def test_should_not_resolve_redirect_model_when_not_configured(self):
+        router = _make_router_with_deployments(
+            [{"litellm_params": {"model": "vertex_ai/claude-sonnet"}}]
+        )
+        data = {"model": "claude-code", "tools": [WEB_SEARCH_TOOL]}
+
+        result = _resolve_websearch_redirect_model(data=data, llm_router=router)
+
+        assert result is None
+
+    def test_should_use_first_configured_redirect_model(self):
+        router = _make_router_with_deployments(
+            [
+                {
+                    "litellm_params": {
+                        "model": "bedrock/converse/anthropic.claude-sonnet",
+                        "websearch_redirect_model": "claude-haiku-web-search",
+                    }
+                },
+                {
+                    "litellm_params": {
+                        "model": "vertex_ai/claude-sonnet",
+                        "websearch_redirect_model": "claude-sonnet-web-search",
+                    }
+                },
+            ]
+        )
+        data = {"model": "claude-code", "tools": [WEB_SEARCH_TOOL]}
+
+        result = _resolve_websearch_redirect_model(data=data, llm_router=router)
+
+        assert result == "claude-haiku-web-search"
+
+    def test_should_lookup_redirect_model_with_request_team_id(self):
+        router = _make_router_with_deployments(
+            [
+                {
+                    "litellm_params": {
+                        "model": "bedrock/converse/anthropic.claude-sonnet",
+                        "websearch_redirect_model": "claude-haiku-web-search",
+                    }
+                }
+            ]
+        )
+        data = {
+            "model": "claude-code",
+            "tools": [WEB_SEARCH_TOOL],
+            "metadata": {"user_api_key_team_id": "team-123"},
+        }
+
+        result = _resolve_websearch_redirect_model(data=data, llm_router=router)
+
+        assert result == "claude-haiku-web-search"
+        router.get_model_list.assert_called_once_with(
+            model_name="claude-code", team_id="team-123"
+        )
+
+    def test_should_treat_redirect_model_as_litellm_only_param(self):
+        assert "websearch_redirect_model" in all_litellm_params
+
+        non_default_params = get_non_default_completion_params(
+            {"model": "openai/gpt-4o", "websearch_redirect_model": "search-model"}
+        )
+
+        assert "websearch_redirect_model" not in non_default_params
+
+    @pytest.mark.asyncio
+    async def test_should_apply_redirect_before_proxy_pre_call_hook(self, monkeypatch):
+        processing_obj = ProxyBaseLLMRequestProcessing(
+            data={
+                "model": "claude-code",
+                "messages": [{"role": "user", "content": "search"}],
+                "tools": [WEB_SEARCH_TOOL],
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "medium"},
+                "context_management": {
+                    "edits": [{"type": "clear_thinking_20251015"}]
+                },
+            }
+        )
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+
+        async def mock_add_litellm_data_to_request(*args, **kwargs):
+            data = kwargs["data"]
+            data["provider_specific_header"] = {
+                "custom_llm_provider": "anthropic,bedrock,vertex_ai",
+                "extra_headers": {
+                    "anthropic-beta": (
+                        "context-1m-2025-08-07,computer-use-2024-10-22"
+                    )
+                },
+            }
+            return data
+
+        async def mock_pre_call_hook(user_api_key_dict, data, call_type):
+            return copy.deepcopy(data)
+
+        mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+        mock_proxy_logging_obj.pre_call_hook = AsyncMock(side_effect=mock_pre_call_hook)
+        mock_user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+        mock_user_api_key_dict.aliases = {}
+        mock_proxy_config = MagicMock()
+        mock_proxy_config._get_hierarchical_router_settings = AsyncMock(
+            return_value=None
+        )
+        router = _make_router_with_deployments(
+            [
+                {
+                    "litellm_params": {
+                        "model": "bedrock/converse/anthropic.claude-sonnet",
+                        "websearch_redirect_model": "claude-haiku-4-5-20251001",
+                    }
+                }
+            ]
+        )
+        monkeypatch.setattr(
+            litellm.proxy.common_request_processing,
+            "add_litellm_data_to_request",
+            mock_add_litellm_data_to_request,
+        )
+
+        returned_data, _ = await processing_obj.common_processing_pre_call_logic(
+            request=mock_request,
+            general_settings={},
+            user_api_key_dict=mock_user_api_key_dict,
+            proxy_logging_obj=mock_proxy_logging_obj,
+            proxy_config=mock_proxy_config,
+            route_type="anthropic_messages",
+            llm_router=router,
+        )
+
+        _, call_kwargs = mock_proxy_logging_obj.pre_call_hook.call_args
+        assert call_kwargs["data"]["model"] == "claude-haiku-4-5-20251001"
+        assert returned_data["model"] == "claude-haiku-4-5-20251001"
+        assert "thinking" not in call_kwargs["data"]
+        assert "thinking" not in returned_data
+        assert "output_config" not in call_kwargs["data"]
+        assert "output_config" not in returned_data
+        assert "context_management" not in call_kwargs["data"]
+        assert "context_management" not in returned_data
+        assert (
+            call_kwargs["data"]["provider_specific_header"]["extra_headers"][
+                "anthropic-beta"
+            ]
+            == "computer-use-2024-10-22"
+        )
+
+    def test_should_strip_context_1m_beta_for_haiku_4_5(self):
+        data = {
+            "model": "claude-haiku-4-5-20251001",
+            "provider_specific_header": {
+                "custom_llm_provider": "anthropic,bedrock,vertex_ai",
+                "extra_headers": {
+                    "anthropic-beta": (
+                        "context-1m-2025-08-07,computer-use-2024-10-22"
+                    ),
+                    "anthropic-version": "2023-06-01",
+                },
+            },
+        }
+
+        _sanitize_websearch_redirected_haiku_4_5_request(
+            data, websearch_redirect_applied=True
+        )
+
+        assert (
+            data["provider_specific_header"]["extra_headers"]["anthropic-beta"]
+            == "computer-use-2024-10-22"
+        )
+        assert (
+            data["provider_specific_header"]["extra_headers"]["anthropic-version"]
+            == "2023-06-01"
+        )
+
+    def test_should_remove_empty_provider_specific_header_for_haiku_4_5(self):
+        data = {
+            "model": "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "provider_specific_header": {
+                "custom_llm_provider": "anthropic,bedrock,vertex_ai",
+                "extra_headers": {"anthropic-beta": "context-1m-2025-08-07"},
+            },
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "medium"},
+        }
+
+        _sanitize_websearch_redirected_haiku_4_5_request(
+            data, websearch_redirect_applied=True
+        )
+
+        assert "provider_specific_header" not in data
+        assert "thinking" not in data
+        assert "output_config" not in data
+
+    def test_should_strip_context_management_for_redirected_haiku_4_5(self):
+        data = {
+            "model": "claude-haiku-4-5-20251001",
+            "context_management": {
+                "edits": [
+                    {"type": "clear_thinking_20251015"},
+                    {"type": "compact_20260112"},
+                ]
+            },
+        }
+
+        _sanitize_websearch_redirected_haiku_4_5_request(
+            data, websearch_redirect_applied=True
+        )
+
+        assert "context_management" not in data
+
+    def test_should_strip_context_1m_beta_from_list_and_case_insensitive_header_for_haiku_4_5(
+        self,
+    ):
+        data = {
+            "model": "claude-haiku-4-5-20251001",
+            "provider_specific_header": {
+                "custom_llm_provider": "anthropic,bedrock,vertex_ai",
+                "extra_headers": {
+                    "Anthropic-Beta": [
+                        "context-1m-2025-08-07",
+                        "computer-use-2024-10-22",
+                    ],
+                },
+            },
+        }
+
+        _sanitize_websearch_redirected_haiku_4_5_request(
+            data, websearch_redirect_applied=True
+        )
+
+        assert data["provider_specific_header"]["extra_headers"][
+            "Anthropic-Beta"
+        ] == ["computer-use-2024-10-22"]
+
+    def test_should_preserve_context_1m_beta_for_non_haiku_4_5(self):
+        data = {
+            "model": "claude-sonnet-4-5-20250929",
+            "provider_specific_header": {
+                "custom_llm_provider": "anthropic,bedrock,vertex_ai",
+                "extra_headers": {"anthropic-beta": "context-1m-2025-08-07"},
+            },
+        }
+
+        _sanitize_websearch_redirected_haiku_4_5_request(
+            data, websearch_redirect_applied=True
+        )
+
+        assert (
+            data["provider_specific_header"]["extra_headers"]["anthropic-beta"]
+            == "context-1m-2025-08-07"
+        )
+
+    def test_should_not_sanitize_direct_haiku_4_5_request_without_websearch_redirect(
+        self,
+    ):
+        data = {
+            "model": "claude-haiku-4-5-20251001",
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "medium"},
+            "provider_specific_header": {
+                "custom_llm_provider": "anthropic,bedrock,vertex_ai",
+                "extra_headers": {"anthropic-beta": "context-1m-2025-08-07"},
+            },
+        }
+
+        _sanitize_websearch_redirected_haiku_4_5_request(
+            data, websearch_redirect_applied=False
+        )
+
+        assert data["thinking"] == {"type": "adaptive"}
+        assert data["output_config"] == {"effort": "medium"}
+        assert (
+            data["provider_specific_header"]["extra_headers"]["anthropic-beta"]
+            == "context-1m-2025-08-07"
+        )
 
 
 class TestProxyBaseLLMRequestProcessing:

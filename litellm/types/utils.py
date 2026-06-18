@@ -3532,6 +3532,7 @@ all_litellm_params = (
         "prompt_label",
         "shared_session",
         "search_tool_name",
+        "websearch_redirect_model",
         "order",
         "enable_tag_filtering",
         "enable_json_schema_validation",

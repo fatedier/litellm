@@ -334,6 +334,7 @@ class GenericLiteLLMParams(CredentialLiteLLMParams, CustomPricingLiteLLMParams):
     merge_reasoning_content_in_choices: bool | None = False
     model_info: dict | None = None
     mock_response: str | ModelResponse | Exception | Any | None = None
+    websearch_redirect_model: str | None = None
 
     # tag-based routing
     tags: list[str] | None = None
@@ -465,6 +466,8 @@ class LiteLLMParamsTypedDict(TypedDict, total=False):
     ## PASS-THROUGH ENDPOINTS ##
     use_in_pass_through: bool | None
     litellm_credential_name: str | None
+    ## WEB SEARCH REDIRECT ##
+    websearch_redirect_model: str | None
     ## UNIFIED PROJECT/REGION ##
     region_name: str | None
     ## VERTEX AI ##
