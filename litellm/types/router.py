@@ -75,6 +75,7 @@ class RouterConfig(BaseModel):
     context_window_fallbacks: list | None = []
     model_group_alias: dict[str, list[str]] | None = {}
     retry_after: int | None = 0
+    enable_retry_deployment_failover: bool | None = False
     retry_responses_without_encrypted_content: Optional[bool] = False
     routing_strategy: Literal[
         "simple-shuffle",
@@ -126,6 +127,7 @@ class UpdateRouterConfig(BaseModel):
     enable_tag_filtering: bool | None = None
     tag_routing_prefix: str | None = None
     retry_responses_without_encrypted_content: Optional[bool] = None
+    enable_retry_deployment_failover: Optional[bool] = None
 
     model_config = ConfigDict(protected_namespaces=())
 

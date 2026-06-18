@@ -448,6 +448,7 @@ class Router:
         health_check_staleness_threshold: int | None = None,
         health_check_ignore_transient_errors: bool = False,
         enable_weighted_failover: bool = False,
+        enable_retry_deployment_failover: bool = False,
         retry_responses_without_encrypted_content: bool = False,
     ) -> None:
         """
@@ -485,6 +486,7 @@ class Router:
             deployment_affinity_ttl_seconds (int): TTL for user-key -> deployment affinity mapping. Defaults to 3600.
             ignore_invalid_deployments (bool): Ignores invalid deployments, and continues with other deployments. Default is to raise an error.
             enable_weighted_failover (bool): When True and the routing strategy is "simple-shuffle", a retryable failure on one deployment causes the request to re-pick (weighted) across the other deployments in the same model group before any cross-group fallback runs. Bounded by `max_fallbacks`. Async-only: currently honored by `router.acompletion()` and other async entrypoints. The sync `router.completion()` path falls back to the regular fallback flow. Defaults to False.
+            enable_retry_deployment_failover (bool): When True, ordinary Router retries exclude deployments that already failed in the same request before affinity filtering is applied. This is request-local and never writes to cooldown state. Defaults to False.
             retry_responses_without_encrypted_content (bool): When True, async Responses requests that fail with invalid encrypted content are retried once on the same selected deployment after removing Responses encrypted state from the request. Defaults to False.
         Returns:
             Router: An instance of the litellm.Router class.
@@ -657,6 +659,7 @@ class Router:
         self.disable_cooldowns = disable_cooldowns
         self.enable_health_check_routing = enable_health_check_routing
         self.enable_weighted_failover = enable_weighted_failover
+        self.enable_retry_deployment_failover = enable_retry_deployment_failover
         self.retry_responses_without_encrypted_content = retry_responses_without_encrypted_content
         self.health_check_ignore_transient_errors = health_check_ignore_transient_errors
         _staleness: Final = health_check_staleness_threshold or (
@@ -3160,6 +3163,50 @@ class Router:
         # cool down the deployment every other tenant sharing this config relies on.
         effective_model_info: Final = kwargs.get("model_info") or deployment.get("model_info") or MappingProxyType({})
         self._set_failed_deployment_id_on_exception(exception, MappingProxyType({"model_info": effective_model_info}))
+
+    def _track_retry_failed_deployment(self, kwargs: dict, exception: Exception) -> None:
+        if not self.enable_retry_deployment_failover:
+            return
+
+        failed_deployment_id = getattr(exception, "failed_deployment_id", None)
+        if not failed_deployment_id:
+            return
+
+        failed_deployment_id = str(failed_deployment_id)
+        kwargs["_retry_last_failed_deployment_id"] = failed_deployment_id
+        excluded_deployment_ids = kwargs.setdefault("_retry_excluded_deployment_ids", [])
+        if not isinstance(excluded_deployment_ids, list):
+            return
+
+        if failed_deployment_id not in excluded_deployment_ids:
+            excluded_deployment_ids.append(failed_deployment_id)
+
+    def _filter_retry_excluded_deployments(
+        self, healthy_deployments: list[dict], request_kwargs: dict | None
+    ) -> list[dict]:
+        if not self.enable_retry_deployment_failover:
+            return healthy_deployments
+
+        if (request_kwargs or {}).get("previous_response_id") is not None:
+            return healthy_deployments
+
+        excluded_deployment_ids = (request_kwargs or {}).get("_retry_excluded_deployment_ids")
+        filtered_deployments = litellm.utils._get_excluded_filtered_deployments(
+            healthy_deployments,
+            excluded_deployment_ids=excluded_deployment_ids,
+        )
+        if filtered_deployments:
+            return filtered_deployments
+
+        last_failed_deployment_id = (request_kwargs or {}).get("_retry_last_failed_deployment_id")
+        filtered_deployments = litellm.utils._get_excluded_filtered_deployments(
+            healthy_deployments,
+            excluded_deployment_ids=[last_failed_deployment_id],
+        )
+        if filtered_deployments:
+            return filtered_deployments
+
+        return healthy_deployments
 
     def _update_kwargs_with_default_litellm_params(
         self, kwargs: dict, metadata_variable_name: str | None = "metadata"
@@ -6714,6 +6761,8 @@ class Router:
             # Fall back to the router setting (then 0) so the comparisons below never
             # hit `None > int`, which would mask the real upstream error with a TypeError.
             num_retries = self.num_retries if self.num_retries is not None else 0
+        kwargs.pop("_retry_excluded_deployment_ids", None)
+        kwargs.pop("_retry_last_failed_deployment_id", None)
 
         ## ADD MODEL GROUP SIZE TO METADATA - used for model_group_rate_limit_error tracking
         _metadata: Final[dict] = kwargs.get("litellm_metadata", kwargs.get("metadata")) or {}
@@ -6738,6 +6787,7 @@ class Router:
             current_attempt = None
             original_exception = e
             deployment_num_retries: Final = getattr(e, "num_retries", None)
+            self._track_retry_failed_deployment(kwargs=kwargs, exception=e)
 
             if (
                 request_num_retries is None
@@ -6754,6 +6804,7 @@ class Router:
             ) = await self._async_get_healthy_deployments(
                 model=kwargs.get("model") or "",
                 parent_otel_span=parent_otel_span,
+                request_kwargs=kwargs,
             )
 
             # Check retry policy FIRST, before should_retry_this_error
@@ -6828,6 +6879,7 @@ class Router:
                     # Always track the latest error so we raise the most
                     # recent exception instead of the first one.
                     original_exception = e
+                    self._track_retry_failed_deployment(kwargs=kwargs, exception=e)
 
                     ## LOGGING
                     kwargs = self.log_retry(kwargs=kwargs, e=e)
@@ -6840,6 +6892,7 @@ class Router:
                         ) = await self._async_get_healthy_deployments(
                             model=_model,
                             parent_otel_span=parent_otel_span,
+                            request_kwargs=kwargs,
                         )
                     else:
                         _healthy_deployments = []
@@ -7466,7 +7519,12 @@ class Router:
         )
         return False
 
-    def _get_healthy_deployments(self, model: str, parent_otel_span: Span | None):
+    def _get_healthy_deployments(
+        self,
+        model: str,
+        parent_otel_span: Span | None,
+        request_kwargs: dict | None = None,
+    ) -> tuple[list[dict], list[dict]]:
         _all_deployments: list = []
         try:
             _, _all_deployments = self._common_checks_available_deployment(
@@ -7483,11 +7541,18 @@ class Router:
         unhealthy_set: Final = set(unhealthy_deployments)
         healthy_deployments: list = [d for d in _all_deployments if d["model_info"]["id"] not in unhealthy_set]
         healthy_deployments = self._filter_blocked_deployments(healthy_deployments)
+        healthy_deployments = self._filter_retry_excluded_deployments(
+            healthy_deployments=healthy_deployments,
+            request_kwargs=request_kwargs,
+        )
 
         return healthy_deployments, _all_deployments
 
     async def _async_get_healthy_deployments(
-        self, model: str, parent_otel_span: Span | None
+        self,
+        model: str,
+        parent_otel_span: Span | None,
+        request_kwargs: dict | None = None,
     ) -> tuple[list[dict], list[dict]]:
         """
         Returns Tuple of:
@@ -7514,6 +7579,10 @@ class Router:
             d for d in _all_deployments if d["model_info"]["id"] not in unhealthy_deployments_set
         ]
         healthy_deployments = self._filter_blocked_deployments(healthy_deployments)
+        healthy_deployments = self._filter_retry_excluded_deployments(
+            healthy_deployments=healthy_deployments,
+            request_kwargs=request_kwargs,
+        )
         return healthy_deployments, _all_deployments
 
     def routing_strategy_pre_call_checks(self, deployment: dict):
@@ -10417,6 +10486,7 @@ class Router:
             "enable_weighted_failover",
             "enable_tag_filtering",
             "tag_routing_prefix",
+            "enable_retry_deployment_failover",
             "retry_responses_without_encrypted_content",
         ]
 
@@ -10456,6 +10526,7 @@ class Router:
             "enable_weighted_failover",
             "enable_tag_filtering",
             "tag_routing_prefix",
+            "enable_retry_deployment_failover",
             "retry_responses_without_encrypted_content",
         ]
 
@@ -11127,6 +11198,10 @@ class Router:
             healthy_deployments = _pre_cooldown_deployments
 
         healthy_deployments = self._filter_blocked_deployments(healthy_deployments)
+        healthy_deployments = self._filter_retry_excluded_deployments(
+            healthy_deployments=healthy_deployments,
+            request_kwargs=request_kwargs,
+        )
 
         healthy_deployments = await self.async_callback_filter_deployments(
             model=model,
@@ -11823,6 +11898,10 @@ class Router:
             healthy_deployments = _pre_cooldown_deployments
 
         healthy_deployments = self._filter_blocked_deployments(healthy_deployments)
+        healthy_deployments = self._filter_retry_excluded_deployments(
+            healthy_deployments=healthy_deployments,
+            request_kwargs=request_kwargs,
+        )
 
         # filter pre-call checks
         if self.enable_pre_call_checks and (messages is not None or input is not None):
