@@ -10,6 +10,9 @@ from litellm.types.router import GenericLiteLLMParams
 from litellm.utils import _add_path_to_api_base
 
 
+AZURE_IMAGE_EDIT_DEFAULT_API_VERSION = "2025-04-01-preview"
+
+
 class AzureImageEditConfig(OpenAIImageEditConfig):
     @staticmethod
     def azure_deployment_image_edit_form_data(data: dict, request_url: str) -> dict:
@@ -102,8 +105,10 @@ class AzureImageEditConfig(OpenAIImageEditConfig):
             cast(str | None, litellm_params.get("api_version"))
             or litellm.api_version
             or get_secret_str("AZURE_API_VERSION")
-            or litellm.AZURE_DEFAULT_API_VERSION
         )
+        if api_version == litellm.AZURE_DEFAULT_API_VERSION:
+            api_version = None
+        api_version = api_version or AZURE_IMAGE_EDIT_DEFAULT_API_VERSION
 
         # Create a new dictionary with existing params
         query_params: Final = dict(original_url.params)

@@ -2,7 +2,10 @@ import urllib.parse
 from unittest.mock import patch
 
 import litellm
-from litellm.llms.azure.image_edit.transformation import AzureImageEditConfig
+from litellm.llms.azure.image_edit.transformation import (
+    AZURE_IMAGE_EDIT_DEFAULT_API_VERSION,
+    AzureImageEditConfig,
+)
 from litellm.types.router import GenericLiteLLMParams
 
 
@@ -149,7 +152,7 @@ def test_azure_finalize_image_edit_strips_model_after_openai_transform():
 #   litellm_params["api_version"]
 #     > litellm.api_version (module-global)
 #     > AZURE_API_VERSION env var
-#     > litellm.AZURE_DEFAULT_API_VERSION
+#     > AZURE_IMAGE_EDIT_DEFAULT_API_VERSION
 #
 # Before this fallback chain existed, image edit only read ``litellm_params``
 # and produced an unversioned URL when callers set api_version via the global
@@ -179,6 +182,19 @@ def test_api_version_uses_litellm_params_first(monkeypatch):
     assert _query_params(url) == {"api-version": "from-params"}
 
 
+def test_api_version_normalizes_generic_azure_default(monkeypatch):
+    monkeypatch.setattr(litellm, "api_version", "from-global", raising=False)
+    monkeypatch.setenv("AZURE_API_VERSION", "from-env")
+
+    url = AzureImageEditConfig().get_complete_url(
+        model=_FALLBACK_MODEL,
+        api_base=_FALLBACK_API_BASE,
+        litellm_params={"api_version": litellm.AZURE_DEFAULT_API_VERSION},
+    )
+
+    assert _query_params(url) == {"api-version": AZURE_IMAGE_EDIT_DEFAULT_API_VERSION}
+
+
 def test_api_version_falls_back_to_litellm_global(monkeypatch):
     monkeypatch.setattr(litellm, "api_version", "from-global", raising=False)
     monkeypatch.setenv("AZURE_API_VERSION", "from-env")
@@ -205,7 +221,7 @@ def test_api_version_falls_back_to_env_var(monkeypatch):
     assert _query_params(url) == {"api-version": "from-env"}
 
 
-def test_api_version_falls_back_to_azure_default(monkeypatch):
+def test_api_version_falls_back_to_image_edit_default(monkeypatch):
     monkeypatch.setattr(litellm, "api_version", None, raising=False)
     monkeypatch.delenv("AZURE_API_VERSION", raising=False)
 
@@ -215,7 +231,7 @@ def test_api_version_falls_back_to_azure_default(monkeypatch):
         litellm_params={},
     )
 
-    assert _query_params(url) == {"api-version": litellm.AZURE_DEFAULT_API_VERSION}
+    assert _query_params(url) == {"api-version": AZURE_IMAGE_EDIT_DEFAULT_API_VERSION}
 
 
 def test_api_version_in_api_base_query_is_preserved(monkeypatch):
