@@ -12,12 +12,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.hooks.proxy_track_cost_callback import (
-    _ProxyDBLogger,
     _get_budget_reservation_from_metadata,
+    _ProxyDBLogger,
     _should_track_cost_callback,
     _update_database_and_spend_counters,
 )
 from litellm.types.utils import CallTypes
+from litellm.types.passthrough_endpoints.pass_through_endpoints import (
+    NOVA_AIGATEWAY_SKIP_FAILURE_SPEND_LOGGING,
+)
 
 
 @pytest.mark.asyncio
@@ -83,6 +86,198 @@ async def test_async_post_call_failure_hook():
         assert metadata["status"] == "failure"
         assert "error_information" in metadata
         assert metadata["original_key"] == "original_value"
+
+
+@pytest.mark.asyncio
+async def test_async_post_call_failure_hook_skips_nova_task_query_not_found_spend_log():
+    logger = _ProxyDBLogger()
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test_api_key",
+        budget_reservation={"reserved_cost": 0.5, "entries": []},
+    )
+
+    with (
+        patch(
+            "litellm.proxy.spend_tracking.budget_reservation.release_budget_reservation",
+            new_callable=AsyncMock,
+        ) as mock_release_budget_reservation,
+        patch(
+            "litellm.proxy.db.db_spend_update_writer.DBSpendUpdateWriter.update_database",
+            new_callable=AsyncMock,
+        ) as mock_update_database,
+    ):
+        await logger.async_post_call_failure_hook(
+            request_data={
+                "litellm_params": {
+                    "proxy_server_request": {
+                        NOVA_AIGATEWAY_SKIP_FAILURE_SPEND_LOGGING: True,
+                    }
+                }
+            },
+            original_exception=Exception("task not found"),
+            user_api_key_dict=user_api_key_dict,
+        )
+
+    mock_release_budget_reservation.assert_awaited_once()
+    mock_update_database.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_async_post_call_failure_hook_merges_litellm_metadata():
+    logger = _ProxyDBLogger()
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test_api_key",
+        user_id="test_user_id",
+    )
+    request_data = {
+        "model": "codex/gpt-5.5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "metadata": {},
+        "litellm_metadata": {
+            "model_group": "codex/gpt-5.5",
+            "model_info": {"id": "deployment-id"},
+            "attempted_retries": 3,
+            "max_retries": 3,
+            "requester_ip_address": "127.0.0.1",
+        },
+        "litellm_params": {
+            "metadata": {"tags": ["failure-test"]},
+            "litellm_metadata": {"api_base": "https://example.com/v1"},
+        },
+        "proxy_server_request": {"metadata_variable_name": "litellm_metadata"},
+        "call_type": "aresponses",
+    }
+
+    with patch(
+        "litellm.proxy.db.db_spend_update_writer.DBSpendUpdateWriter.update_database",
+        new_callable=AsyncMock,
+    ) as mock_update_database:
+        await logger.async_post_call_failure_hook(
+            request_data=request_data,
+            original_exception=Exception("Provider error"),
+            user_api_key_dict=user_api_key_dict,
+        )
+
+        mock_update_database.assert_called_once()
+        kwargs = mock_update_database.call_args[1]["kwargs"]
+        assert kwargs["call_type"] == "aresponses"
+
+        metadata = kwargs["litellm_params"]["metadata"]
+        assert metadata["status"] == "failure"
+        assert metadata["model_group"] == "codex/gpt-5.5"
+        assert metadata["model_info"] == {"id": "deployment-id"}
+        assert metadata["attempted_retries"] == 3
+        assert metadata["max_retries"] == 3
+        assert metadata["api_base"] == "https://example.com/v1"
+        assert metadata["requester_ip_address"] == "127.0.0.1"
+        assert metadata["tags"] == ["failure-test"]
+        assert "error_information" in metadata
+        assert kwargs["litellm_params"]["litellm_metadata"] == metadata
+
+        from litellm.proxy.spend_tracking.spend_tracking_utils import (
+            get_logging_payload,
+        )
+
+        payload = get_logging_payload(
+            kwargs=kwargs,
+            response_obj=Exception("Provider error"),
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+        )
+        assert payload["call_type"] == "aresponses"
+        assert payload["model_group"] == "codex/gpt-5.5"
+        assert payload["model_id"] == "deployment-id"
+        payload_metadata = json.loads(payload["metadata"])
+        assert payload_metadata["attempted_retries"] == 3
+        assert payload_metadata["max_retries"] == 3
+
+
+@pytest.mark.asyncio
+async def test_async_post_call_failure_hook_overwrites_spoofed_identity_metadata():
+    logger = _ProxyDBLogger()
+    user_api_key_dict = UserAPIKeyAuth(api_key="test_api_key")
+    request_data = {
+        "model": "codex/gpt-5.5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "metadata": {
+            "user_api_key_team_id": "spoofed-team",
+            "user_api_key_user_id": "spoofed-user",
+        },
+        "litellm_metadata": {
+            "user_api_key_org_id": "spoofed-org",
+            "model_group": "codex/gpt-5.5",
+            "model_info": {"id": "deployment-id"},
+        },
+        "proxy_server_request": {"metadata_variable_name": "litellm_metadata"},
+    }
+
+    with patch(
+        "litellm.proxy.db.db_spend_update_writer.DBSpendUpdateWriter.update_database",
+        new_callable=AsyncMock,
+    ) as mock_update_database:
+        await logger.async_post_call_failure_hook(
+            request_data=request_data,
+            original_exception=Exception("Provider error"),
+            user_api_key_dict=user_api_key_dict,
+        )
+
+        metadata = mock_update_database.call_args[1]["kwargs"]["litellm_params"][
+            "metadata"
+        ]
+        assert metadata["user_api_key_team_id"] is None
+        assert metadata["user_api_key_user_id"] is None
+        assert metadata["user_api_key_org_id"] is None
+        assert metadata["model_group"] == "codex/gpt-5.5"
+        assert metadata["model_info"] == {"id": "deployment-id"}
+
+
+@pytest.mark.asyncio
+async def test_async_post_call_failure_hook_preserves_trusted_metadata():
+    logger = _ProxyDBLogger()
+    user_api_key_dict = UserAPIKeyAuth(api_key="test_api_key")
+    request_data = {
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "metadata": {
+            "user_api_key": "test_api_key",
+            "requester_ip_address": "127.0.0.1",
+            "tags": ["trusted-tag"],
+        },
+        "litellm_metadata": {
+            "user_api_key": "client-spoofed-key",
+            "requester_ip_address": "spoofed-ip",
+            "tags": ["spoofed-tag"],
+            "client_key": "client-value",
+            "model_info": {"id": "spoofed-deployment-id"},
+        },
+        "litellm_params": {
+            "metadata": {
+                "requester_ip_address": "spoofed-litellm-params-ip",
+                "tags": ["spoofed-litellm-params-tag"],
+                "model_group": "gpt-4o",
+            },
+        },
+        "proxy_server_request": {"metadata_variable_name": "metadata"},
+    }
+
+    with patch(
+        "litellm.proxy.db.db_spend_update_writer.DBSpendUpdateWriter.update_database",
+        new_callable=AsyncMock,
+    ) as mock_update_database:
+        await logger.async_post_call_failure_hook(
+            request_data=request_data,
+            original_exception=Exception("Provider error"),
+            user_api_key_dict=user_api_key_dict,
+        )
+
+        metadata = mock_update_database.call_args[1]["kwargs"]["litellm_params"][
+            "metadata"
+        ]
+        assert metadata["requester_ip_address"] == "127.0.0.1"
+        assert metadata["tags"] == ["trusted-tag"]
+        assert "client_key" not in metadata
+        assert metadata["model_group"] == "gpt-4o"
+        assert "model_info" not in metadata
 
 
 @pytest.mark.asyncio

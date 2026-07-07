@@ -27,6 +27,9 @@ from litellm.proxy.spend_tracking.spend_tracking_utils import (
     _sanitize_error_information_for_spend_logs,
 )
 from litellm.proxy.utils import ProxyUpdateSpend
+from litellm.types.passthrough_endpoints.pass_through_endpoints import (
+    NOVA_AIGATEWAY_SKIP_FAILURE_SPEND_LOGGING,
+)
 from litellm.types.utils import (
     CallTypes,
     StandardLoggingPayload,
@@ -80,6 +83,14 @@ class _ProxyDBLogger(CustomLogger):
                 verbose_proxy_logger.exception(
                     "Failed to invalidate budget reservation counters after failure release failed"
                 )
+
+        litellm_params = request_data.get("litellm_params")
+        proxy_server_request = litellm_params.get("proxy_server_request") if isinstance(litellm_params, dict) else None
+        if (
+            isinstance(proxy_server_request, dict)
+            and proxy_server_request.get(NOVA_AIGATEWAY_SKIP_FAILURE_SPEND_LOGGING) is True
+        ):
+            return
 
         request_route: Final = user_api_key_dict.request_route
         if (

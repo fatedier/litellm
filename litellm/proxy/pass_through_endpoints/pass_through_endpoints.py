@@ -75,7 +75,10 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY,
     LITELLM_PASS_THROUGH_ENDPOINT_MARKER,
     LITELLM_PASS_THROUGH_RAW_BODY_STATE_KEY,
+    NOVA_AIGATEWAY_BILLING_HEADER_NAME,
+    NOVA_AIGATEWAY_SKIP_FAILURE_SPEND_LOGGING,
     EndpointType,
+    PassThroughSpecialType,
     PassthroughStandardLoggingPayload,
 )
 from litellm.types.utils import Usage
@@ -715,6 +718,21 @@ def _build_passthrough_failure_request_payload(
     return request_payload
 
 
+def _should_skip_nova_aigateway_not_found_spend_log(
+    response: httpx.Response,
+    request_payload: dict,
+) -> bool:
+    passthrough_logging_payload = request_payload.get("passthrough_logging_payload")
+    if not isinstance(passthrough_logging_payload, dict):
+        return False
+    return (
+        response.status_code == 404
+        and passthrough_logging_payload.get("passthrough_type") == PassThroughSpecialType.NOVA_AIGATEWAY.value
+        and str(passthrough_logging_payload.get("request_method") or "").upper() == "GET"
+        and not response.headers.get(NOVA_AIGATEWAY_BILLING_HEADER_NAME)
+    )
+
+
 async def _log_passthrough_upstream_failure(
     response: httpx.Response,
     user_api_key_dict: UserAPIKeyAuth,
@@ -730,6 +748,21 @@ async def _log_passthrough_upstream_failure(
     """
     if response.status_code < 400:
         return
+    if _should_skip_nova_aigateway_not_found_spend_log(
+        response=response,
+        request_payload=request_payload,
+    ):
+        litellm_params = request_payload.get("litellm_params")
+        if isinstance(litellm_params, dict):
+            proxy_server_request = litellm_params.get("proxy_server_request")
+            if isinstance(proxy_server_request, dict):
+                request_payload["litellm_params"] = {
+                    **litellm_params,
+                    "proxy_server_request": {
+                        **proxy_server_request,
+                        NOVA_AIGATEWAY_SKIP_FAILURE_SPEND_LOGGING: True,
+                    },
+                }
     from litellm.proxy.proxy_server import proxy_logging_obj
 
     try:
@@ -780,6 +813,7 @@ async def pass_through_request(
     stream: bool | None = None,
     cost_per_request: float | None = None,
     custom_llm_provider: str | None = None,
+    passthrough_type: str | None = None,
     guardrails_config: dict | None = None,
     timeout: float | None = None,
 ):
@@ -799,6 +833,7 @@ async def pass_through_request(
         stream: Whether to stream the response
         cost_per_request: Optional field - cost per request to the target endpoint
         custom_llm_provider: Optional field - custom LLM provider for the endpoint
+        passthrough_type: Optional field - special passthrough behavior selector
         guardrails_config: Optional field - guardrails configuration for passthrough endpoint
         timeout: Optional per-endpoint timeout in seconds. Falls back to
             general_settings.pass_through_request_timeout, then 600s.
@@ -928,6 +963,7 @@ async def pass_through_request(
             request_body=_parsed_body,
             request_method=getattr(request, "method", None),
             cost_per_request=cost_per_request,
+            passthrough_type=passthrough_type,
         )
         kwargs = HttpPassThroughEndpointHelpers._init_kwargs_for_pass_through_endpoint(
             user_api_key_dict=user_api_key_dict,
@@ -1665,6 +1701,7 @@ def create_pass_through_route(
     include_subpath: bool | None = False,
     cost_per_request: float | None = None,
     custom_llm_provider: str | None = None,
+    passthrough_type: str | None = None,
     is_streaming_request: bool | None = False,
     query_params: dict | None = None,
     default_query_params: dict | None = None,
@@ -1746,6 +1783,7 @@ def create_pass_through_route(
                 "forward_headers": _forward_headers,
                 "merge_query_params": _merge_query_params,
                 "cost_per_request": cost_per_request,
+                "passthrough_type": passthrough_type,
                 "guardrails": None,
                 "timeout": timeout,
             }
@@ -1759,6 +1797,7 @@ def create_pass_through_route(
             param_forward_headers: Final = target_params.get("forward_headers", _forward_headers)
             param_merge_query_params: Final = target_params.get("merge_query_params", _merge_query_params)
             param_cost_per_request: Final = target_params.get("cost_per_request", cost_per_request)
+            param_passthrough_type: Final = target_params.get("passthrough_type", passthrough_type)
             param_guardrails: Final = target_params.get("guardrails", None)
             param_default_query_params: Final = target_params.get("default_query_params", None)
             param_timeout: Final = target_params.get("timeout", timeout)
@@ -1805,6 +1844,7 @@ def create_pass_through_route(
                     custom_body=final_custom_body,
                     cost_per_request=cast(float | None, param_cost_per_request),
                     custom_llm_provider=custom_llm_provider,
+                    passthrough_type=cast(str | None, param_passthrough_type),
                     guardrails_config=cast(dict | None, param_guardrails),
                     timeout=cast(float | None, param_timeout),
                 )
@@ -2503,6 +2543,7 @@ class InitPassThroughEndpointHelpers:
         default_query_params: dict | None = None,
         config_file_path: str | None = None,
         auth: bool = False,
+        passthrough_type: str | None = None,
         timeout: float | None = None,
     ):
         """Add exact path route for pass-through endpoint"""
@@ -2544,6 +2585,7 @@ class InitPassThroughEndpointHelpers:
                 default_query_params=default_query_params,
                 guardrails=guardrails,
                 config_file_path=config_file_path,
+                passthrough_type=passthrough_type,
                 timeout=timeout,
             ),
             methods=methods,
@@ -2565,6 +2607,7 @@ class InitPassThroughEndpointHelpers:
                 "default_query_params": default_query_params,
                 "dependencies": dependencies,
                 "cost_per_request": cost_per_request,
+                "passthrough_type": passthrough_type,
                 "guardrails": guardrails,
                 "timeout": timeout,
             },
@@ -2586,6 +2629,7 @@ class InitPassThroughEndpointHelpers:
         default_query_params: dict | None = None,
         config_file_path: str | None = None,
         auth: bool = False,
+        passthrough_type: str | None = None,
         timeout: float | None = None,
     ):
         """Add wildcard route for sub-paths"""
@@ -2628,6 +2672,7 @@ class InitPassThroughEndpointHelpers:
                 default_query_params=default_query_params,
                 guardrails=guardrails,
                 config_file_path=config_file_path,
+                passthrough_type=passthrough_type,
                 timeout=timeout,
             ),
             methods=methods,
@@ -2649,6 +2694,7 @@ class InitPassThroughEndpointHelpers:
                 "default_query_params": default_query_params,
                 "dependencies": dependencies,
                 "cost_per_request": cost_per_request,
+                "passthrough_type": passthrough_type,
                 "guardrails": guardrails,
                 "timeout": timeout,
             },
@@ -2824,6 +2870,7 @@ async def _register_pass_through_endpoint(
     guardrails: Final = endpoint_data.get("guardrails")
     methods: Final = endpoint_data.get("methods")
     cost_per_request: Final = endpoint_data.get("cost_per_request")
+    passthrough_type: Final = endpoint_data.get("passthrough_type")
     timeout: Final = endpoint_data.get("timeout")
 
     verbose_proxy_logger.debug("Initializing pass through endpoint: %s (ID: %s)", path, endpoint_id)
@@ -2842,6 +2889,7 @@ async def _register_pass_through_endpoint(
         default_query_params=default_query_params,
         config_file_path=config_file_path,
         auth=auth_enforced,
+        passthrough_type=passthrough_type,
         timeout=timeout,
     )
 
@@ -2869,6 +2917,7 @@ async def _register_pass_through_endpoint(
             default_query_params=default_query_params,
             config_file_path=config_file_path,
             auth=auth_enforced,
+            passthrough_type=passthrough_type,
             timeout=timeout,
         )
         visited_endpoints.add(f"{endpoint_id}:subpath:{path}:{methods_str}")

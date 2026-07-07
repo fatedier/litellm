@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Final
+from typing import Final, Optional
 
 from typing_extensions import TypedDict
 
@@ -25,6 +25,14 @@ class EndpointType(str, Enum):
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
     GENERIC = "generic"
+
+
+class PassThroughSpecialType(str, Enum):
+    NOVA_AIGATEWAY = "nova_aigateway"
+
+
+NOVA_AIGATEWAY_BILLING_HEADER_NAME = "X-Nova-AIGateway-Billing"
+NOVA_AIGATEWAY_SKIP_FAILURE_SPEND_LOGGING = "_skip_nova_aigateway_failure_spend_logging"
 
 
 class PassthroughStandardLoggingPayload(TypedDict, total=False):
@@ -58,3 +66,5 @@ class PassthroughStandardLoggingPayload(TypedDict, total=False):
 
     Optional field, we use this for cost tracking only if it's set.
     """
+
+    passthrough_type: Optional[str]

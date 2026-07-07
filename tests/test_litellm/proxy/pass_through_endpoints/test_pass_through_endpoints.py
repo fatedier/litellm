@@ -20,25 +20,29 @@ sys.path.insert(
     0, os.path.abspath("../../..")
 )  # Adds the parent directory to the system path
 
+from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     DEFAULT_PASS_THROUGH_REQUEST_TIMEOUT_SECONDS,
+    LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY,
     HttpPassThroughEndpointHelpers,
     InitPassThroughEndpointHelpers,
-    LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY,
+    _log_passthrough_upstream_failure,
     _registered_pass_through_routes,
+    _should_skip_nova_aigateway_not_found_spend_log,
     create_pass_through_route,
     initialize_pass_through_endpoints,
     pass_through_request,
-    resolve_pass_through_request_timeout,
     resolve_llm_passthrough_timeout,
+    resolve_pass_through_request_timeout,
 )
 from litellm.integrations.custom_logger import CustomLogger
-from litellm.proxy._types import UserAPIKeyAuth
-from litellm.types.passthrough_endpoints.pass_through_endpoints import (
-    LITELLM_PASS_THROUGH_RAW_BODY_STATE_KEY,
-)
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
+)
+from litellm.types.passthrough_endpoints.pass_through_endpoints import (
+    LITELLM_PASS_THROUGH_RAW_BODY_STATE_KEY,
+    NOVA_AIGATEWAY_BILLING_HEADER_NAME,
+    NOVA_AIGATEWAY_SKIP_FAILURE_SPEND_LOGGING,
 )
 
 
@@ -366,6 +370,57 @@ async def test_pass_through_request_failure_handler():
                 assert "traceback_str" in call_args
 
 
+@pytest.mark.asyncio
+async def test_create_pass_through_route_passes_nova_aigateway_type():
+    mock_request = MagicMock(spec=Request)
+    mock_request.url.path = "/dashscope/api/v1/tasks"
+    mock_request.method = "GET"
+    mock_request.state = SimpleNamespace()
+
+    with (
+        patch(
+            "litellm.proxy.types_utils.utils.get_instance_fn",
+            side_effect=ValueError("not an adapter"),
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._parse_request_data_by_content_type",
+            new=AsyncMock(return_value=({}, None, None, False)),
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.pass_through_request",
+            new=AsyncMock(return_value="ok"),
+        ) as mock_pass_through_request,
+        patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.InitPassThroughEndpointHelpers.is_registered_pass_through_route",
+            return_value=True,
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.InitPassThroughEndpointHelpers.get_registered_pass_through_route",
+            return_value={
+                "passthrough_params": {
+                    "target": "https://nova-aigateway.example.com/dashscope/api/v1/tasks",
+                    "passthrough_type": "nova_aigateway",
+                }
+            },
+        ),
+    ):
+        endpoint_func = create_pass_through_route(
+            endpoint="/dashscope/api/v1/tasks",
+            target="https://nova-aigateway.example.com/dashscope/api/v1/tasks",
+            passthrough_type="nova_aigateway",
+            include_subpath=True,
+        )
+        result = await endpoint_func(
+            request=mock_request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+        )
+
+    assert result == "ok"
+    call_kwargs = mock_pass_through_request.call_args.kwargs
+    assert call_kwargs["passthrough_type"] == "nova_aigateway"
+
+
 def test_is_langfuse_route():
     """
     Test that the is_langfuse_route method correctly identifies Langfuse routes
@@ -567,6 +622,56 @@ async def test_langfuse_passthrough_no_logging():
         mock_logging_obj.model_call_details["passthrough_logging_payload"]
         == passthrough_logging_payload
     )
+
+
+@pytest.mark.asyncio
+async def test_nova_aigateway_task_query_without_billing_header_skips_logging():
+    from datetime import datetime
+
+    from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+    from litellm.types.passthrough_endpoints.pass_through_endpoints import (
+        PassthroughStandardLoggingPayload,
+    )
+
+    handler = PassThroughEndpointLogging()
+    handler._handle_logging = AsyncMock()
+
+    mock_logging_obj = MagicMock(spec=LiteLLMLoggingObj)
+    mock_logging_obj.model_call_details = {}
+
+    url = "http://nova-aigateway.example.com/dashscope/api/v1/tasks/task-123"
+    response = httpx.Response(
+        200,
+        json={"output": {"task_id": "task-123", "task_status": "SUCCEEDED"}},
+        request=httpx.Request("GET", url),
+    )
+    passthrough_logging_payload = PassthroughStandardLoggingPayload(
+        url=url,
+        request_body={},
+        request_method="GET",
+        passthrough_type="nova_aigateway",
+    )
+
+    result = await handler.pass_through_async_success_handler(
+        httpx_response=response,
+        response_body={"output": {"task_id": "task-123", "task_status": "SUCCEEDED"}},
+        logging_obj=mock_logging_obj,
+        url_route=url,
+        result="",
+        start_time=datetime.now(),
+        end_time=datetime.now(),
+        cache_hit=False,
+        request_body={},
+        passthrough_logging_payload=passthrough_logging_payload,
+    )
+
+    assert result is None
+    handler._handle_logging.assert_not_called()
+    assert (
+        mock_logging_obj.model_call_details["passthrough_logging_payload"]
+        == passthrough_logging_payload
+    )
+    assert "response_cost" not in mock_logging_obj.model_call_details
 
 
 def test_construct_target_url_with_subpath():
@@ -4004,6 +4109,78 @@ _UPSTREAM_ERROR_BODY = {
     "request_id": "req_mock_403",
     "trace_id": "trace_mock_403",
 }
+
+
+@pytest.mark.parametrize(
+    "method,status_code,headers,expected",
+    [
+        ("GET", 404, {}, True),
+        ("GET", 500, {}, False),
+        ("POST", 404, {}, False),
+        ("GET", 404, {NOVA_AIGATEWAY_BILLING_HEADER_NAME: "billing"}, False),
+    ],
+)
+def test_nova_aigateway_not_found_spend_log_filter_is_narrow(
+    method, status_code, headers, expected
+):
+    response = httpx.Response(
+        status_code=status_code,
+        headers=headers,
+        request=httpx.Request(method, "https://nova-aigateway.example.com/tasks/task-123"),
+    )
+    request_payload = {
+        "passthrough_logging_payload": {
+            "passthrough_type": "nova_aigateway",
+            "request_method": method,
+        }
+    }
+
+    assert (
+        _should_skip_nova_aigateway_not_found_spend_log(
+            response=response,
+            request_payload=request_payload,
+        )
+        is expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_nova_aigateway_get_not_found_marks_failure_spend_log_skipped():
+    response = httpx.Response(
+        status_code=404,
+        request=httpx.Request("GET", "https://nova-aigateway.example.com/tasks/task-123"),
+    )
+    request_payload = {
+        "litellm_params": {
+            "proxy_server_request": {
+                "url": "https://nova-aigateway.example.com/tasks/task-123",
+                "method": "GET",
+            }
+        },
+        "passthrough_logging_payload": {
+            "passthrough_type": "nova_aigateway",
+            "request_method": "GET",
+        }
+    }
+
+    with patch("litellm.proxy.proxy_server.proxy_logging_obj") as mock_proxy_logging:
+        mock_proxy_logging.post_call_failure_hook = AsyncMock()
+        await _log_passthrough_upstream_failure(
+            response=response,
+            user_api_key_dict=UserAPIKeyAuth(),
+            request_payload=request_payload,
+        )
+
+    mock_proxy_logging.post_call_failure_hook.assert_awaited_once()
+    failure_request_data = mock_proxy_logging.post_call_failure_hook.await_args.kwargs[
+        "request_data"
+    ]
+    assert (
+        failure_request_data["litellm_params"]["proxy_server_request"][
+            NOVA_AIGATEWAY_SKIP_FAILURE_SPEND_LOGGING
+        ]
+        is True
+    )
 
 
 @pytest.mark.asyncio

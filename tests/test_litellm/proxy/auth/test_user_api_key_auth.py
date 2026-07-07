@@ -34,6 +34,7 @@ from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.auth.user_api_key_auth import (
     _check_key_model_budget_with_fallback,
     _PendingAutoRegister,
+    _matches_pass_through_endpoint_route,
     _matches_routing_override,
     _reserve_budget_after_common_checks,
     _route_requires_auth_despite_public,
@@ -924,6 +925,42 @@ def test_get_api_key_with_custom_litellm_key_header_aws_sigv4():
     )
     _assert_get_api_key_with_custom_litellm_key_header(
         custom_litellm_key_header=header, api_key=token, passed_in_key=header
+    )
+
+
+def test_matches_pass_through_endpoint_route_supports_nova_aigateway_task_lookup():
+    endpoint = {
+        "path": "/dashscope/api/v1/tasks",
+        "passthrough_type": "nova_aigateway",
+    }
+
+    assert (
+        _matches_pass_through_endpoint_route(
+            route="/dashscope/api/v1/tasks",
+            endpoint=endpoint,
+        )
+        is True
+    )
+    assert (
+        _matches_pass_through_endpoint_route(
+            route="/dashscope/api/v1/tasks/task-123",
+            endpoint=endpoint,
+        )
+        is True
+    )
+    assert (
+        _matches_pass_through_endpoint_route(
+            route="/dashscope/api/v1/tasks/",
+            endpoint=endpoint,
+        )
+        is False
+    )
+    assert (
+        _matches_pass_through_endpoint_route(
+            route="/dashscope/api/v1/task",
+            endpoint=endpoint,
+        )
+        is False
     )
 
 

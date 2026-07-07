@@ -92,6 +92,9 @@ from litellm.proxy.utils import (
     normalize_route_for_root_path,
 )
 from litellm.repositories.table_repositories import TeamMembershipRepository
+from litellm.types.passthrough_endpoints.pass_through_endpoints import (
+    PassThroughSpecialType,
+)
 from litellm.secret_managers.main import get_secret_bool
 from litellm.types.services import ServiceTypes
 
@@ -560,6 +563,21 @@ def get_rbac_role(jwt_handler: JWTHandler, scopes: list[str]) -> str:
         return LitellmUserRoles.TEAM
 
 
+def _matches_pass_through_endpoint_route(route: str, endpoint: dict) -> bool:
+    endpoint_path = endpoint.get("path", "")
+    if not isinstance(endpoint_path, str) or not endpoint_path:
+        return False
+
+    if route == endpoint_path:
+        return True
+
+    if endpoint.get("passthrough_type") != PassThroughSpecialType.NOVA_AIGATEWAY.value:
+        return False
+
+    suffix = route[len(endpoint_path) :] if route.startswith(endpoint_path) else ""
+    return bool(suffix and suffix.startswith("/") and suffix.strip("/"))
+
+
 def get_api_key(
     custom_litellm_key_header: str | None,
     api_key: str,
@@ -610,7 +628,7 @@ def get_api_key(
         api_key = google_auth_key
     elif pass_through_endpoints is not None:
         for endpoint in pass_through_endpoints:
-            if endpoint.get("path", "") == route:
+            if _matches_pass_through_endpoint_route(route=route, endpoint=endpoint):
                 headers: dict | None = endpoint.get("headers", None)
                 if headers is not None:
                     header_key: str = headers.get("litellm_user_api_key", "")
@@ -638,7 +656,9 @@ async def check_api_key_for_custom_headers_or_pass_through_endpoints(
             api_key = request.headers.get("litellm_user_api_key") or ""
     if pass_through_endpoints is not None:
         for endpoint in pass_through_endpoints:
-            if isinstance(endpoint, dict) and endpoint.get("path", "") == route:
+            if isinstance(endpoint, dict) and _matches_pass_through_endpoint_route(
+                route=route, endpoint=endpoint
+            ):
                 ## IF AUTH DISABLED
                 # Default to True: a config dict with no ``auth`` key
                 # otherwise produced an unauthenticated forwarder. The
@@ -2211,7 +2231,11 @@ async def _run_centralized_common_checks(
     pass_through_endpoints: Final = general_settings.get("pass_through_endpoints", None)
     if pass_through_endpoints is not None:
         for endpoint in pass_through_endpoints:
-            if isinstance(endpoint, dict) and endpoint.get("path", "") == route and endpoint.get("auth") is not True:
+            if (
+                isinstance(endpoint, dict)
+                and _matches_pass_through_endpoint_route(route=route, endpoint=endpoint)
+                and endpoint.get("auth") is not True
+            ):
                 return
 
     # No-auth dev mode: master_key unset AND no JWT/OAuth2 auth
