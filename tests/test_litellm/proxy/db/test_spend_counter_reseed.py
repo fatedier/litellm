@@ -69,6 +69,28 @@ async def test_repair_during_cold_reseed_does_not_double_counter():
 
 
 @pytest.mark.asyncio
+async def test_spend_counter_survives_many_concurrent_entity_counters():
+    """
+    Regression: spend_counter_cache used InMemoryCache's default 200-entry
+    cap, so with >200 active user/key/team/end-user/tag counters the LRU
+    constantly evicted live budget counters. Every eviction forces a cold
+    reseed from the DB, which is both wasted load and the window in which
+    the reseed/repair doubling race fires.
+    """
+    counter_key = "spend:user:eviction-guard-user"
+    cache = proxy_server.spend_counter_cache
+    other_keys = [f"spend:end_user:evict-{i}" for i in range(300)]
+    try:
+        cache.in_memory_cache.set_cache(key=counter_key, value=15.0)
+        for key in other_keys:
+            cache.in_memory_cache.set_cache(key=key, value=1.0)
+        assert cache.in_memory_cache.get_cache(key=counter_key) == 15.0
+    finally:
+        for key in [counter_key, *other_keys]:
+            cache.in_memory_cache.delete_cache(key=key)
+
+
+@pytest.mark.asyncio
 async def test_repair_stale_spend_counter_only_raises_counter():
     counter_key = "spend:user:reseed-monotonic-user"
     cache = proxy_server.spend_counter_cache
