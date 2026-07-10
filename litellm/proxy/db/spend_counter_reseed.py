@@ -72,7 +72,45 @@ class SpendCounterReseed:
             return lock
 
     @staticmethod
-    async def from_db(prisma_client: Optional["PrismaClient"], counter_key: str) -> float | None:
+    async def repair_floor(
+        spend_counter_cache: "DualCache",
+        counter_key: str,
+        db_spend: float,
+    ) -> None:
+        """
+        Monotonically raise a counter to the authoritative DB floor, under the
+        same per-counter lock `coalesced` holds while seeding.
+
+        The lock is load-bearing: `coalesced` seeds a cold counter via
+        [check -> await DB read -> increment by db_spend]. An unlocked set
+        landing inside that await window gets db_spend incremented on top of
+        it, leaving the counter at exactly 2x the recorded spend and blocking
+        the entity with a spurious BudgetExceededError until the counter
+        expires.
+        """
+        lock = await SpendCounterReseed._get_lock(counter_key)
+        async with lock:
+            cached = spend_counter_cache.in_memory_cache.get_cache(key=counter_key)
+            needs_update = True
+            if cached is not None:
+                try:
+                    needs_update = float(cached) < db_spend
+                except (TypeError, ValueError):
+                    needs_update = True
+            if needs_update:
+                spend_counter_cache.in_memory_cache.set_cache(key=counter_key, value=db_spend)
+            if spend_counter_cache.redis_cache is not None:
+                try:
+                    await spend_counter_cache.redis_cache.async_set_max(key=counter_key, value=db_spend)
+                except Exception:
+                    verbose_proxy_logger.debug(
+                        "SpendCounterReseed.repair_floor: unable to repair counter %s in Redis",
+                        counter_key,
+                        exc_info=True,
+                    )
+
+    @staticmethod
+    async def from_db(prisma_client: Optional["PrismaClient"], counter_key: str) -> Optional[float]:
         """
         Read the authoritative spend for a counter from the DB.
 

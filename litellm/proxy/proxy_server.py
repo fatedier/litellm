@@ -2497,31 +2497,17 @@ async def _repair_stale_spend_counter(counter_key: str, db_spend: float) -> None
     corrected value directly instead of re-deriving it per request, and so a
     worker whose own cached spend is also stale still sees the true total.
 
-    The write is monotonic: it only ever raises the counter, so a repair that
-    carries a slightly-stale DB total cannot clobber a concurrent increment that
-    already pushed the counter higher (which would let racing requests
-    under-count). Redis enforces this atomically via async_set_max; the
-    in-memory copy is guarded by a read-compare-write with no await in between,
-    so it is atomic within the worker.
+    The write is monotonic and runs under the per-counter reseed lock (see
+    SpendCounterReseed.repair_floor): it only ever raises the counter, and it
+    cannot interleave with a cold reseed's [check -> DB read -> increment]
+    window, which would stack the seed increment on top of this set and leave
+    the counter at exactly 2x the recorded spend.
     """
-    cached: Final = spend_counter_cache.in_memory_cache.get_cache(key=counter_key)
-    needs_update = True
-    if cached is not None:
-        try:
-            needs_update = float(cached) < db_spend
-        except (TypeError, ValueError):
-            needs_update = True
-    if needs_update:
-        spend_counter_cache.in_memory_cache.set_cache(key=counter_key, value=db_spend)
-    if spend_counter_cache.redis_cache is not None:
-        try:
-            await spend_counter_cache.redis_cache.async_set_max(key=counter_key, value=db_spend)
-        except Exception:
-            verbose_proxy_logger.debug(
-                "Unable to repair stale spend counter %s in Redis",
-                counter_key,
-                exc_info=True,
-            )
+    await SpendCounterReseed.repair_floor(
+        spend_counter_cache=spend_counter_cache,
+        counter_key=counter_key,
+        db_spend=db_spend,
+    )
 
 
 async def reseed_spend_counter_from_db(counter_key: str) -> None:
