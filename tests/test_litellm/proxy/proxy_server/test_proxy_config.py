@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock
@@ -1513,6 +1514,27 @@ def test_ProxyConfig_get_model_info_with_id_returns_router_model_info():
         "blocked": dumped.get("blocked"),
     }
     assert snapshot == {"id": "m-1", "db_model": True, "blocked": False}
+
+
+def test_get_model_info_returns_created_at_without_premium_user(monkeypatch):
+    monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", False)
+    created_at = datetime(2026, 7, 1, 12, 34, 56, tzinfo=timezone.utc)
+    model = SimpleNamespace(
+        model_id="m-1",
+        model_info={},
+        blocked=False,
+        created_at=created_at,
+        updated_at=created_at,
+        created_by="creator",
+        updated_by="updater",
+    )
+
+    out = ProxyConfig().get_model_info_with_id(model=model, db_model=True)
+
+    assert out.created_at == created_at
+    assert out.updated_at is None
+    assert out.created_by is None
+    assert out.updated_by is None
 
 
 def test_ProxyConfig_get_model_info_with_id_missing_model_id_raises(monkeypatch):
