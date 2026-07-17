@@ -8284,6 +8284,12 @@ class ProviderConfigManager:
             )
 
             return DashScopeAnthropicMessagesConfig()
+        elif litellm.LlmProviders.MOONSHOT == provider:
+            from litellm.llms.moonshot.messages.transformation import (
+                MoonshotAnthropicMessagesConfig,
+            )
+
+            return MoonshotAnthropicMessagesConfig()
         return None
 
     @staticmethod
