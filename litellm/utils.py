@@ -8284,6 +8284,12 @@ class ProviderConfigManager:
             )
 
             return DashScopeAnthropicMessagesConfig()
+        elif litellm.LlmProviders.VOLCENGINE == provider:
+            from litellm.llms.volcengine.messages.transformation import (
+                VolcEngineAnthropicMessagesConfig,
+            )
+
+            return VolcEngineAnthropicMessagesConfig()
         elif litellm.LlmProviders.MOONSHOT == provider:
             from litellm.llms.moonshot.messages.transformation import (
                 MoonshotAnthropicMessagesConfig,
