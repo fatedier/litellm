@@ -26,6 +26,7 @@ from litellm.constants import (
     GLOBAL_PROXY_SPEND_CACHE_KEY,
     LITELLM_PROXY_BUDGET_NAME,
     LITELLM_PROXY_MASTER_KEY_ALIAS,
+    SPECIAL_LITELLM_AUTH_TOKEN,
 )
 from litellm.integrations.otel.model.config import is_otel_v2_enabled
 from litellm.integrations.otel.runtime import phase_span, seed_request_identity
@@ -85,6 +86,7 @@ from litellm.proxy.common_utils.http_parsing_utils import (
 )
 from litellm.proxy.common_utils.realtime_utils import _realtime_request_body
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
 from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
 from litellm.proxy.utils import (
     PrismaClient,
@@ -656,9 +658,7 @@ async def check_api_key_for_custom_headers_or_pass_through_endpoints(
             api_key = request.headers.get("litellm_user_api_key") or ""
     if pass_through_endpoints is not None:
         for endpoint in pass_through_endpoints:
-            if isinstance(endpoint, dict) and _matches_pass_through_endpoint_route(
-                route=route, endpoint=endpoint
-            ):
+            if isinstance(endpoint, dict) and _matches_pass_through_endpoint_route(route=route, endpoint=endpoint):
                 ## IF AUTH DISABLED
                 # Default to True: a config dict with no ``auth`` key
                 # otherwise produced an unauthenticated forwarder. The
@@ -1104,6 +1104,60 @@ async def _record_unparsable_body_failure(
     except Exception as e:  # noqa: BLE001  # any logging failure must leave the caller's 400 untouched
         verbose_proxy_logger.exception("Failed to log the request rejected for an unparsable body: %s", e)
 
+async def _get_user_for_virtual_key_or_raise(
+    valid_token: UserAPIKeyAuth,
+    prisma_client: PrismaClient | None,
+    user_api_key_cache: UserApiKeyCache,
+    parent_otel_span: "Span | None",
+    proxy_logging_obj: ProxyLogging | None,
+) -> "LiteLLM_UserTable | None":
+    if (
+        valid_token.user_id is None
+        or valid_token.is_session_token
+        or valid_token.token in SPECIAL_LITELLM_AUTH_TOKEN
+        or valid_token.token == LITELLM_PROXY_MASTER_KEY_ALIAS
+        or valid_token.api_key == LITELLM_PROXY_MASTER_KEY_ALIAS
+    ):
+        return None
+
+    try:
+        with tracer.trace("litellm.proxy.auth.get_user_object"):
+            user_obj = await get_user_object(
+                user_id=valid_token.user_id,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                user_id_upsert=False,
+                parent_otel_span=parent_otel_span,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+    except Exception as e:
+        database_error = next(
+            (
+                error
+                for error in (e.__cause__, e.__context__, e)
+                if isinstance(error, Exception)
+                and PrismaDBExceptionHandler.is_database_service_unavailable_error(error)
+            ),
+            None,
+        )
+        if database_error is not None:
+            raise database_error
+        raise ProxyException(
+            message="Authentication Error, the user associated with this key does not exist.",
+            type=ProxyErrorTypes.auth_error,
+            param="user_id",
+            code=status.HTTP_401_UNAUTHORIZED,
+        ) from e
+
+    if user_obj is None:
+        raise ProxyException(
+            message="Authentication Error, the user associated with this key does not exist.",
+            type=ProxyErrorTypes.auth_error,
+            param="user_id",
+            code=status.HTTP_401_UNAUTHORIZED,
+        )
+    return user_obj
+
 
 async def _user_api_key_auth_builder(
     request: Request,
@@ -1141,6 +1195,8 @@ async def _user_api_key_auth_builder(
         pass
     route: Final[str] = get_request_route(request=request)
     valid_token: UserAPIKeyAuth | None = None
+    mapped_virtual_key_user: LiteLLM_UserTable | None = None
+    mapped_virtual_key_user_checked = False
     custom_auth_api_key: bool = False
 
     try:
@@ -1310,6 +1366,7 @@ async def _user_api_key_auth_builder(
                             mapped_user_email = jwt_handler.get_user_email(token=mapped_claims, default_value=None)
                             mapped_jwt_user_id: Final = jwt_handler.get_user_id(token=mapped_claims, default_value=None)
                             if mapped_user_email is not None and mapped_jwt_user_id == valid_token.user_id:
+                                mapped_virtual_key_user_checked = True  # rebind-ok: request-local mapped-key state
                                 try:
                                     mapped_user_obj: Final = await get_user_object(
                                         user_id=valid_token.user_id,
@@ -1323,8 +1380,33 @@ async def _user_api_key_auth_builder(
                                 except Exception as e:
                                     verbose_proxy_logger.debug("JWT mapped-key user_email backfill skipped: %s", e)
                                 else:
-                                    if mapped_user_obj is not None:
-                                        valid_token.user_email = mapped_user_obj.user_email
+                                    if mapped_user_obj is None:
+                                        raise ProxyException(
+                                            message="Authentication Error, the user associated with this key does not exist.",
+                                            type=ProxyErrorTypes.auth_error,
+                                            param="user_id",
+                                            code=status.HTTP_401_UNAUTHORIZED,
+                                        )
+                                    mapped_virtual_key_user = mapped_user_obj
+                                    valid_token.user_email = mapped_user_obj.user_email
+                            else:
+                                mapped_virtual_key_user = await _get_user_for_virtual_key_or_raise(
+                                    valid_token=valid_token,
+                                    prisma_client=prisma_client,
+                                    user_api_key_cache=user_api_key_cache,
+                                    parent_otel_span=parent_otel_span,
+                                    proxy_logging_obj=proxy_logging_obj,
+                                )
+                                mapped_virtual_key_user_checked = True  # rebind-ok: request-local mapped-key state
+                        else:
+                            mapped_virtual_key_user = await _get_user_for_virtual_key_or_raise(
+                                valid_token=valid_token,
+                                prisma_client=prisma_client,
+                                user_api_key_cache=user_api_key_cache,
+                                parent_otel_span=parent_otel_span,
+                                proxy_logging_obj=proxy_logging_obj,
+                            )
+                            mapped_virtual_key_user_checked = True  # rebind-ok: request-local mapped-key state
                     elif isinstance(resolve_result, _PendingAutoRegister):
                         # Run full JWT policy (RBAC, scope, custom_validate,
                         # email-domain) via auth_builder, then create the key
@@ -1641,6 +1723,13 @@ async def _user_api_key_auth_builder(
                         code=status.HTTP_401_UNAUTHORIZED,
                         param=abbreviate_api_key(api_key=api_key),
                     )
+            await _get_user_for_virtual_key_or_raise(
+                valid_token=valid_token,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                parent_otel_span=parent_otel_span,
+                proxy_logging_obj=proxy_logging_obj,
+            )
             valid_token = update_valid_token_with_end_user_params(
                 valid_token=valid_token, end_user_params=end_user_params
             )
@@ -1814,22 +1903,16 @@ async def _user_api_key_auth_builder(
 
             # Check 2. If user_id for this token is in budget - done in common_checks()
             if valid_token.user_id is not None:
-                try:
-                    with tracer.trace("litellm.proxy.auth.get_user_object"):
-                        user_obj = await get_user_object(
-                            user_id=valid_token.user_id,
-                            prisma_client=prisma_client,
-                            user_api_key_cache=user_api_key_cache,
-                            user_id_upsert=False,
-                            parent_otel_span=parent_otel_span,
-                            proxy_logging_obj=proxy_logging_obj,
-                        )
-                except Exception as e:
-                    verbose_logger.debug(
-                        "litellm.proxy.auth.user_api_key_auth.py::user_api_key_auth() - Unable to get user from db/cache. Setting user_obj to None. Exception received - %s",
-                        e,
+                if mapped_virtual_key_user_checked:
+                    user_obj = mapped_virtual_key_user
+                else:
+                    user_obj = await _get_user_for_virtual_key_or_raise(
+                        valid_token=valid_token,
+                        prisma_client=prisma_client,
+                        user_api_key_cache=user_api_key_cache,
+                        parent_otel_span=parent_otel_span,
+                        proxy_logging_obj=proxy_logging_obj,
                     )
-                    user_obj = None
 
                 if (
                     user_obj is not None

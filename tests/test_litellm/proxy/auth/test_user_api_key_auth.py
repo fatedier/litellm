@@ -34,6 +34,7 @@ from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.auth.user_api_key_auth import (
     _check_key_model_budget_with_fallback,
     _PendingAutoRegister,
+    _get_user_for_virtual_key_or_raise,
     _matches_pass_through_endpoint_route,
     _matches_routing_override,
     _reserve_budget_after_common_checks,
@@ -45,6 +46,7 @@ from litellm.proxy.auth.user_api_key_auth import (
     get_api_key,
     user_api_key_auth,
 )
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 
 
 class _RoutingRequest:
@@ -92,6 +94,130 @@ def test_public_ai_hub_routes_remain_public():
     ):
         assert route in LiteLLMRoutes.public_routes.value
         assert _route_requires_auth_despite_public(route, {}) is False
+
+
+@pytest.mark.asyncio
+async def test_virtual_key_is_rejected_when_its_user_does_not_exist():
+    token = UserAPIKeyAuth(token="hashed-key", user_id="deleted-user")
+
+    with patch(
+        "litellm.proxy.auth.user_api_key_auth.get_user_object",
+        new_callable=AsyncMock,
+        side_effect=ValueError("User doesn't exist in db."),
+    ) as mock_get_user:
+        with pytest.raises(ProxyException) as exc_info:
+            await _get_user_for_virtual_key_or_raise(
+                valid_token=token,
+                prisma_client=MagicMock(),
+                user_api_key_cache=MagicMock(),
+                parent_otel_span=None,
+                proxy_logging_obj=MagicMock(),
+            )
+
+    assert exc_info.value.type == ProxyErrorTypes.auth_error
+    assert int(exc_info.value.code) == status.HTTP_401_UNAUTHORIZED
+    assert "associated with this key does not exist" in exc_info.value.message
+    mock_get_user.assert_awaited_once_with(
+        user_id="deleted-user",
+        prisma_client=ANY,
+        user_api_key_cache=ANY,
+        user_id_upsert=False,
+        parent_otel_span=None,
+        proxy_logging_obj=ANY,
+    )
+
+
+@pytest.mark.asyncio
+async def test_virtual_key_user_lookup_uses_cached_user():
+    cache = UserApiKeyCache()
+    await cache.async_set_cache(
+        key="existing-user",
+        value=LiteLLM_UserTable(user_id="existing-user"),
+        model_type=LiteLLM_UserTable,
+        ttl=60,
+    )
+    prisma_client = MagicMock()
+
+    result = await _get_user_for_virtual_key_or_raise(
+        valid_token=UserAPIKeyAuth(token="hashed-key", user_id="existing-user"),
+        prisma_client=prisma_client,
+        user_api_key_cache=cache,
+        parent_otel_span=None,
+        proxy_logging_obj=None,
+    )
+
+    assert result is not None
+    assert result.user_id == "existing-user"
+    assert prisma_client.mock_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "token",
+    [
+        UserAPIKeyAuth(token="service-account-key"),
+        UserAPIKeyAuth(
+            token="litellm_proxy_master_key",
+            api_key="litellm_proxy_master_key",
+            user_id="admin",
+        ),
+        UserAPIKeyAuth(token="ui-token", user_id="ui-user"),
+        UserAPIKeyAuth(
+            token="cli-session",
+            user_id="cli-user",
+            is_session_token=True,
+        ),
+    ],
+)
+async def test_virtual_key_user_lookup_skips_non_db_tokens(token):
+    with patch(
+        "litellm.proxy.auth.user_api_key_auth.get_user_object",
+        new_callable=AsyncMock,
+    ) as mock_get_user:
+        result = await _get_user_for_virtual_key_or_raise(
+            valid_token=token,
+            prisma_client=MagicMock(),
+            user_api_key_cache=MagicMock(),
+            parent_otel_span=None,
+            proxy_logging_obj=MagicMock(),
+        )
+
+    assert result is None
+    mock_get_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_virtual_key_user_lookup_preserves_database_outage():
+    database_error = ConnectionError("connection refused")
+    try:
+        raise database_error
+    except ConnectionError:
+        try:
+            raise ValueError("User doesn't exist in db.")
+        except ValueError as error_with_context:
+            lookup_error = error_with_context
+
+    assert lookup_error.__cause__ is None
+    assert lookup_error.__context__ is database_error
+
+    with patch(
+        "litellm.proxy.auth.user_api_key_auth.get_user_object",
+        new_callable=AsyncMock,
+        side_effect=lookup_error,
+    ):
+        with pytest.raises(ConnectionError) as exc_info:
+            await _get_user_for_virtual_key_or_raise(
+                valid_token=UserAPIKeyAuth(
+                    token="hashed-key",
+                    user_id="existing-user",
+                ),
+                prisma_client=MagicMock(),
+                user_api_key_cache=MagicMock(),
+                parent_otel_span=None,
+                proxy_logging_obj=MagicMock(),
+            )
+
+    assert exc_info.value is database_error
 
 
 @pytest.mark.asyncio
@@ -1471,6 +1597,10 @@ async def test_cached_proxy_admin_key_sets_via_virtual_key_marker():
             "litellm.proxy.auth.resolvers.store.IdentityStore._resolve_key",
             new_callable=AsyncMock,
             return_value=cached_token,
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth.get_user_object",
+            new_callable=AsyncMock,
+            return_value=LiteLLM_UserTable(user_id="cached-admin-user", user_role="proxy_admin"),
         ):
             result = await _user_api_key_auth_builder(
                 request=request,
@@ -1629,7 +1759,7 @@ async def test_db_virtual_key_auth_sets_via_virtual_key_marker():
             patch(
                 "litellm.proxy.auth.user_api_key_auth.get_user_object",
                 new_callable=AsyncMock,
-                return_value=None,
+                return_value=LiteLLM_UserTable(user_id="marker-test-user", user_role="internal_user"),
             ),
         ):
             result = await _user_api_key_auth_builder(
@@ -2387,7 +2517,6 @@ class TestJWTOAuth2Coexistence:
         mock_request.headers = {"authorization": f"Bearer {jwt_token}"}
         mock_request.query_params = {}
         mock_request.state = SimpleNamespace()
-
         with (
             patch("litellm.proxy.proxy_server.general_settings", general_settings),
             patch("litellm.proxy.proxy_server.premium_user", True),
@@ -5152,6 +5281,32 @@ async def test_builder_returns_401_when_db_lookup_reports_missing_key():
         await _run_builder_with_key_lookup(get_key_object)
 
     assert int(exc_info.value.code) == status.HTTP_401_UNAUTHORIZED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user_role",
+    [LitellmUserRoles.INTERNAL_USER, LitellmUserRoles.PROXY_ADMIN],
+)
+async def test_builder_rejects_virtual_key_when_its_user_is_missing(user_role):
+    valid_token = UserAPIKeyAuth(
+        token="hashed-valid",
+        user_id="deleted-user",
+        user_role=user_role,
+    )
+
+    with patch(
+        "litellm.proxy.auth.user_api_key_auth.get_user_object",
+        new_callable=AsyncMock,
+        side_effect=ValueError("User doesn't exist in db."),
+    ) as mock_get_user:
+        with pytest.raises(ProxyException) as exc_info:
+            await _run_builder_with_key_lookup(AsyncMock(return_value=valid_token))
+
+    assert exc_info.value.type == ProxyErrorTypes.auth_error
+    assert int(exc_info.value.code) == status.HTTP_401_UNAUTHORIZED
+    assert "associated with this key does not exist" in exc_info.value.message
+    mock_get_user.assert_awaited_once()
 
 
 @pytest.mark.asyncio
