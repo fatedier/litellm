@@ -1,7 +1,8 @@
 """
 Pulls the cost + context window + provider route for known models from https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json
 
-This can be disabled by setting the LITELLM_LOCAL_MODEL_COST_MAP environment variable to True.
+Set LITELLM_LOCAL_MODEL_COST_MAP=True to use the bundled local map, or set
+LITELLM_MODEL_COST_MAP_PATH to select a repository-managed or mounted JSON map.
 
 ```
 export LITELLM_LOCAL_MODEL_COST_MAP=True
@@ -16,7 +17,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.resources import files
-from typing import Final, Protocol
+from pathlib import Path
+from typing import Final, Optional, Protocol
 
 import httpx
 
@@ -53,11 +55,26 @@ class GetModelCostMap:
     _backup_model_count: int = -1  # -1 = not yet loaded
 
     @staticmethod
-    def load_local_model_cost_map() -> dict:
-        """Load the local backup model cost map bundled with the package."""
-        content: Final = json.loads(
-            files("litellm").joinpath("model_prices_and_context_window_backup.json").read_text(encoding="utf-8")
-        )
+    def _read_local_model_cost_map(path: Optional[str]) -> str:
+        if path is None:
+            package_resource = files("litellm").joinpath("model_prices_and_context_window_backup.json")
+            return package_resource.read_text(encoding="utf-8")
+
+        configured_path = Path(path).expanduser()
+        if configured_path.is_absolute() or configured_path.exists():
+            return configured_path.read_text(encoding="utf-8")
+
+        raw_package_parts = configured_path.parts
+        package_parts = raw_package_parts[1:] if raw_package_parts[:1] == ("litellm",) else raw_package_parts
+        if not package_parts or any(part in {"", ".", ".."} for part in package_parts):
+            raise ValueError(f"Invalid package-relative model cost map path: {path}")
+        package_resource = files("litellm").joinpath(*package_parts)
+        return package_resource.read_text(encoding="utf-8")
+
+    @staticmethod
+    def load_local_model_cost_map(path: Optional[str] = None) -> dict:
+        """Load a model cost map from the package or an explicitly configured path."""
+        content: Final = json.loads(GetModelCostMap._read_local_model_cost_map(path))
         return content
 
     @classmethod
@@ -293,6 +310,18 @@ async def refetch_model_cost_map(
             model_cost_map=_finalize_model_cost_map(GetModelCostMap.load_local_model_cost_map())
         )
 
+    local_model_cost_map_path = os.getenv("LITELLM_MODEL_COST_MAP_PATH", "").strip()
+    if local_model_cost_map_path:
+        _cost_map_source_info.source = "local"
+        _cost_map_source_info.url = None
+        _cost_map_source_info.is_env_forced = True
+        _cost_map_source_info.fallback_reason = None
+        return ModelCostMapReloaded(
+            model_cost_map=_finalize_model_cost_map(
+                GetModelCostMap.load_local_model_cost_map(path=local_model_cost_map_path)
+            )
+        )
+
     result: Final = await _fetch_remote_model_cost_map_with_retry(
         url=url,
         timeout=timeout,
@@ -427,8 +456,10 @@ def get_model_cost_map(url: str) -> dict:
     """
     Public entry point — returns the model cost map dict.
 
-    1. If ``LITELLM_LOCAL_MODEL_COST_MAP`` is set, uses the local backup only.
-    2. Otherwise fetches from ``url``, validates integrity, and falls back
+    1. If ``LITELLM_MODEL_COST_MAP_PATH`` is set, uses that local map only.
+    2. Otherwise, if ``LITELLM_LOCAL_MODEL_COST_MAP`` is set, uses the bundled
+       local backup only.
+    3. Otherwise fetches from ``url``, validates integrity, and falls back
        to the local backup on any failure.
 
     Only the backup model count is cached (a single int) for validation.
@@ -438,6 +469,14 @@ def get_model_cost_map(url: str) -> dict:
     _cost_map_source_info.loaded_at = datetime.now(timezone.utc)
     # Note: can't use get_secret_bool here — this runs during litellm.__init__
     # before litellm._key_management_settings is set.
+    local_model_cost_map_path = os.getenv("LITELLM_MODEL_COST_MAP_PATH", "").strip()
+    if local_model_cost_map_path:
+        _cost_map_source_info.source = "local"
+        _cost_map_source_info.url = None
+        _cost_map_source_info.is_env_forced = True
+        _cost_map_source_info.fallback_reason = None
+        return _expand_model_aliases(GetModelCostMap.load_local_model_cost_map(path=local_model_cost_map_path))
+
     if os.getenv("LITELLM_LOCAL_MODEL_COST_MAP", "").lower() == "true":
         _cost_map_source_info.source = "local"
         _cost_map_source_info.url = None

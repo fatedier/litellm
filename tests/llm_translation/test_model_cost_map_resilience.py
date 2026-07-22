@@ -14,8 +14,6 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 import litellm
@@ -213,6 +211,31 @@ class TestGetModelCostMapFallback:
                 mock_get.assert_not_called()
 
         assert isinstance(result, dict)
+        assert len(result) > 0
+
+    def test_should_use_explicit_local_map_path(self, tmp_path, monkeypatch):
+        """An explicit path should load only that map and skip remote fetching."""
+        custom_map = {"custom-model": {"input_cost_per_token": 1.0}}
+        custom_path = tmp_path / "custom-model-prices.json"
+        custom_path.write_text(json.dumps(custom_map), encoding="utf-8")
+        monkeypatch.setenv("LITELLM_MODEL_COST_MAP_PATH", str(custom_path))
+        monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
+        with patch("httpx.get") as mock_get:
+            result = get_model_cost_map("https://fake-url.com/model_prices.json")
+
+        mock_get.assert_not_called()
+        assert result == custom_map
+
+    def test_should_load_package_relative_map_path(self, monkeypatch):
+        """A package-relative path should resolve from the installed litellm package."""
+        monkeypatch.setenv(
+            "LITELLM_MODEL_COST_MAP_PATH",
+            "model_prices_and_context_window_backup.json",
+        )
+
+        result = get_model_cost_map("https://fake-url.com/model_prices.json")
+
         assert len(result) > 0
 
 
