@@ -568,16 +568,41 @@ class ProxyLogging:
                 passed_in_args["internal_usage_cache"] = self.internal_usage_cache
             if "prisma_client" in expected_args:
                 passed_in_args["prisma_client"] = prisma_client
+            if "llm_router_getter" in expected_args:
+                passed_in_args["llm_router_getter"] = self._get_current_llm_router
             proxy_hook_obj = cast(CustomLogger, proxy_hook(**passed_in_args))
             litellm.logging_callback_manager.add_litellm_callback(proxy_hook_obj)
 
             self.proxy_hook_mapping[hook] = proxy_hook_obj
+
+    @staticmethod
+    def _get_current_llm_router() -> Optional[Router]:
+        from litellm.proxy.proxy_server import llm_router
+
+        return llm_router
 
     def get_proxy_hook(self, hook: str) -> CustomLogger | None:
         """
         Get a proxy hook from the proxy_hook_mapping
         """
         return self.proxy_hook_mapping.get(hook)
+
+    async def _check_budget_after_model_reroute(
+        self,
+        user_api_key_dict: UserAPIKeyAuth,
+        data: dict,
+        call_type: CallTypesLiteral,
+    ) -> None:
+        max_budget_limiter = self.get_proxy_hook("max_budget_limiter")
+        if not isinstance(max_budget_limiter, _PROXY_MaxBudgetLimiter):
+            return
+
+        await max_budget_limiter.async_pre_call_hook(
+            user_api_key_dict=user_api_key_dict,
+            cache=self.call_details["user_api_key_cache"],
+            data=data,
+            call_type=call_type,
+        )
 
     def _init_litellm_callbacks(self, llm_router: Router | None = None):
         self._add_proxy_hooks(llm_router)
@@ -1395,6 +1420,7 @@ class ProxyLogging:
                 call_type=call_type,
             )
 
+        model_before_pipeline = data.get("model")
         try:
             # Execute guardrail pipelines before the normal callback loop
             data = await self._maybe_execute_pipelines(
@@ -1503,12 +1529,25 @@ class ProxyLogging:
                     call_type=call_type,
                 )
 
+            if data is not None and data.get("model") != model_before_pipeline:
+                await self._check_budget_after_model_reroute(
+                    user_api_key_dict=user_api_key_dict,
+                    data=data,
+                    call_type=call_type,
+                )
+
             if data is not None:
                 self._process_guardrail_metadata(data)
 
             return data
         except SensitiveDataRouteException as e:
             data = await self._handle_sensitive_data_route_exception(e, data, user_api_key_dict)
+            if data is not None and data.get("model") != model_before_pipeline:
+                await self._check_budget_after_model_reroute(
+                    user_api_key_dict=user_api_key_dict,
+                    data=data,
+                    call_type=call_type,
+                )
             if data is not None:
                 self._process_guardrail_metadata(data)
             return data

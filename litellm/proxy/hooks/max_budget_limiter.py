@@ -1,4 +1,4 @@
-from typing import Final
+from typing import TYPE_CHECKING, Callable, Final, Optional
 
 from fastapi import HTTPException
 
@@ -11,11 +11,13 @@ from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
 from litellm.proxy.hooks.rate_limiter_utils import resolve_llm_provider_for_rate_limit
 
+if TYPE_CHECKING:
+    from litellm.router import Router
+
 
 class _PROXY_MaxBudgetLimiter(CustomLogger):
-    # Class variables or attributes
-    def __init__(self):
-        pass
+    def __init__(self, llm_router_getter: Optional[Callable[[], Optional["Router"]]] = None):
+        self.llm_router_getter = llm_router_getter
 
     async def async_pre_call_hook(
         self,
@@ -39,6 +41,13 @@ class _PROXY_MaxBudgetLimiter(CustomLogger):
                 and general_settings.get("apply_user_budget_to_team_keys") is not True
             ):
                 return
+
+            llm_router = self.llm_router_getter() if self.llm_router_getter is not None else None
+            if llm_router is not None:
+                from litellm.proxy.auth.auth_checks import _is_model_cost_zero
+
+                if _is_model_cost_zero(model=data.get("model") if data else None, llm_router=llm_router):
+                    return
 
             # The reservation path admits at the strict-`<` boundary and
             # atomically pre-fills the same counter we'd read here. Re-checking

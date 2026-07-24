@@ -16,9 +16,7 @@ import pytest
 
 import litellm
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
-from litellm.proxy.utils import (
-    ProxyLogging,
-)
+from litellm.proxy.utils import ProxyLogging
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +302,31 @@ def test_add_proxy_hooks_registers_prisma_requiring_hook_with_db(proxy_logging, 
         "needs_db_hook_got_prisma": True,
         "db_only_hook_got_prisma": True,
     }
+
+
+def test_add_proxy_hooks_injects_router(proxy_logging, monkeypatch):
+    from litellm.proxy import utils as utils_mod
+
+    router = MagicMock()
+
+    class _RouterHook:
+        def __init__(self, llm_router_getter=None):
+            self.llm_router_getter = llm_router_getter
+
+    monkeypatch.setattr(utils_mod, "PROXY_HOOKS", ["max_budget_limiter"])
+    monkeypatch.setattr(utils_mod, "get_proxy_hook", lambda _: _RouterHook)
+    monkeypatch.setattr(
+        litellm.logging_callback_manager,
+        "add_litellm_callback",
+        lambda _: None,
+    )
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", None),
+        patch("litellm.proxy.proxy_server.llm_router", router),
+    ):
+        proxy_logging._add_proxy_hooks(llm_router=router)
+        assert proxy_logging.proxy_hook_mapping["max_budget_limiter"].llm_router_getter() is router
 
 
 def test_add_proxy_hooks_unknown_hook_raises(proxy_logging, monkeypatch):

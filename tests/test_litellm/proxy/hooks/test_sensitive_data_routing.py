@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 
 from litellm.caching.caching import DualCache
 from litellm.exceptions import SensitiveDataRouteException
@@ -19,11 +20,13 @@ from litellm.integrations.custom_guardrail import (
     get_session_id_from_request_data,
 )
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.hooks.max_budget_limiter import _PROXY_MaxBudgetLimiter
 from litellm.proxy.hooks.sensitive_data_routing import (
     _PROXY_SensitiveDataRoutingHandler,
     SENSITIVE_ROUTING_CACHE_PREFIX,
     DEFAULT_SENSITIVE_ROUTING_TTL,
 )
+from litellm.types.router import ModelGroupInfo
 
 
 class MockInternalUsageCache:
@@ -39,6 +42,43 @@ class MockInternalUsageCache:
     async def async_set_cache(self, key: str, value: Any, ttl: int = 3600, **kwargs):
         self._cache[key] = value
         self._ttls[key] = ttl
+
+
+_BUDGET_MODEL_COSTS = {
+    "free-model-id": {"input_cost_per_token": 0.0, "output_cost_per_token": 0.0},
+    "free-target-id": {"input_cost_per_token": 0.0, "output_cost_per_token": 0.0},
+    "paid-target-id": {"input_cost_per_token": 0.001, "output_cost_per_token": 0.001},
+}
+
+
+def _make_budget_router() -> MagicMock:
+    router = MagicMock()
+    router.model_list = [
+        {"model_name": model_name, "model_info": {"id": f"{model_name}-id"}}
+        for model_name in ("free-model", "free-target", "paid-target")
+    ]
+    model_info = {
+        "free-model": ModelGroupInfo(
+            model_group="free-model",
+            providers=["openai"],
+            input_cost_per_token=0.0,
+            output_cost_per_token=0.0,
+        ),
+        "free-target": ModelGroupInfo(
+            model_group="free-target",
+            providers=["openai"],
+            input_cost_per_token=0.0,
+            output_cost_per_token=0.0,
+        ),
+        "paid-target": ModelGroupInfo(
+            model_group="paid-target",
+            providers=["openai"],
+            input_cost_per_token=0.001,
+            output_cost_per_token=0.001,
+        ),
+    }
+    router.get_model_group_info.side_effect = lambda model_group: model_info.get(model_group)
+    return router
 
 
 class TestSensitiveDataRoutingHandler:
@@ -936,6 +976,91 @@ class TestPreCallHookDeferredRouting:
         assert recorder.ran is True
         assert result["model"] == "on-prem-model"
         assert result["metadata"]["sensitive_data_routing_applied"] is True
+
+    @pytest.mark.asyncio
+    async def test_rerouted_paid_model_rechecks_personal_budget(self, proxy_logging):
+        import litellm
+
+        router = _make_budget_router()
+        max_budget_limiter = _PROXY_MaxBudgetLimiter(llm_router_getter=lambda: router)
+        proxy_logging.proxy_hook_mapping["max_budget_limiter"] = max_budget_limiter
+        routing_guardrail = _RoutingGuardrail(
+            guardrail_name="router",
+            default_on=True,
+            event_hook="pre_call",
+            on_sensitive_data="route",
+            sensitive_data_route_to_model="paid-target",
+            sticky_session_routing=False,
+        )
+        litellm.callbacks = [max_budget_limiter, routing_guardrail]
+        user_api_key_dict = UserAPIKeyAuth(
+            api_key="tenant-a",
+            user_id="user-1",
+            user_max_budget=0.0,
+        )
+
+        with (
+            patch.object(litellm, "model_cost", _BUDGET_MODEL_COSTS),
+            patch(
+                "litellm.proxy.proxy_server.get_current_spend",
+                new=AsyncMock(return_value=0.0),
+            ) as mock_get_spend,
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await proxy_logging.pre_call_hook(
+                user_api_key_dict=user_api_key_dict,
+                data={"model": "free-model", "metadata": {"session_id": "sess-paid"}},
+                call_type="completion",
+            )
+
+        assert exc_info.value.status_code == 429
+        mock_get_spend.assert_awaited_once()
+        assert [call.kwargs["model_group"] for call in router.get_model_group_info.call_args_list] == [
+            "free-model",
+            "paid-target",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_rerouted_free_model_remains_budget_exempt(self, proxy_logging):
+        import litellm
+
+        router = _make_budget_router()
+        max_budget_limiter = _PROXY_MaxBudgetLimiter(llm_router_getter=lambda: router)
+        proxy_logging.proxy_hook_mapping["max_budget_limiter"] = max_budget_limiter
+        routing_guardrail = _RoutingGuardrail(
+            guardrail_name="router",
+            default_on=True,
+            event_hook="pre_call",
+            on_sensitive_data="route",
+            sensitive_data_route_to_model="free-target",
+            sticky_session_routing=False,
+        )
+        litellm.callbacks = [max_budget_limiter, routing_guardrail]
+        user_api_key_dict = UserAPIKeyAuth(
+            api_key="tenant-a",
+            user_id="user-1",
+            user_max_budget=0.0,
+        )
+
+        with (
+            patch.object(litellm, "model_cost", _BUDGET_MODEL_COSTS),
+            patch(
+                "litellm.proxy.proxy_server.get_current_spend",
+                new=AsyncMock(return_value=0.0),
+            ) as mock_get_spend,
+        ):
+            result = await proxy_logging.pre_call_hook(
+                user_api_key_dict=user_api_key_dict,
+                data={"model": "free-model", "metadata": {"session_id": "sess-free"}},
+                call_type="completion",
+            )
+
+        assert result["model"] == "free-target"
+        mock_get_spend.assert_not_awaited()
+        assert [call.kwargs["model_group"] for call in router.get_model_group_info.call_args_list] == [
+            "free-model",
+            "free-target",
+        ]
 
     @pytest.mark.asyncio
     async def test_later_blocking_guardrail_overrides_routing(self, proxy_logging):

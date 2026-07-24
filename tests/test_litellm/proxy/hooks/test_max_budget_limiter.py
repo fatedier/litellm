@@ -11,14 +11,16 @@ reserving the smallest remaining headroom).
 These tests pin the skip-when-reserved behavior and guard against drift.
 """
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
+import litellm
 from litellm.caching.caching import DualCache
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.hooks.max_budget_limiter import _PROXY_MaxBudgetLimiter
+from litellm.types.router import ModelGroupInfo
 
 
 def _make_user_api_key_auth(
@@ -235,3 +237,94 @@ async def test_no_max_budget_passes():
 
     assert result is None
     mock_get_spend.assert_not_awaited()
+
+
+def _make_router_for_budget_test(model: str, input_cost: float, output_cost: float) -> MagicMock:
+    router = MagicMock()
+    model_id = f"{model}-id"
+    router.model_list = [{"model_name": model, "model_info": {"id": model_id}}]
+    model_group_info = ModelGroupInfo(
+        model_group=model,
+        providers=["openai"],
+        input_cost_per_token=input_cost,
+        output_cost_per_token=output_cost,
+    )
+    router.get_model_group_info.side_effect = lambda model_group: model_group_info if model_group == model else None
+    return router
+
+
+@pytest.mark.asyncio
+async def test_zero_cost_model_skips_user_budget_check():
+    model = "free-model"
+    router = _make_router_for_budget_test(model=model, input_cost=0.0, output_cost=0.0)
+    handler = _PROXY_MaxBudgetLimiter(llm_router_getter=lambda: router)
+    user_api_key_dict = _make_user_api_key_auth(user_max_budget=0.0)
+
+    with patch.object(
+        litellm,
+        "model_cost",
+        {"free-model-id": {"input_cost_per_token": 0.0, "output_cost_per_token": 0.0}},
+    ):
+        with patch(
+            "litellm.proxy.proxy_server.get_current_spend",
+            new=AsyncMock(return_value=0.0),
+        ) as mock_get_spend:
+            result = await handler.async_pre_call_hook(
+                user_api_key_dict=user_api_key_dict,
+                cache=DualCache(),
+                data={"model": model},
+                call_type="completion",
+            )
+
+    assert result is None
+    mock_get_spend.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_paid_model_does_not_skip_user_budget_check():
+    model = "paid-model"
+    router = _make_router_for_budget_test(model=model, input_cost=0.001, output_cost=0.002)
+    handler = _PROXY_MaxBudgetLimiter(llm_router_getter=lambda: router)
+    user_api_key_dict = _make_user_api_key_auth(user_max_budget=0.0)
+
+    with patch.object(
+        litellm,
+        "model_cost",
+        {"paid-model-id": {"input_cost_per_token": 0.001, "output_cost_per_token": 0.002}},
+    ):
+        with patch(
+            "litellm.proxy.proxy_server.get_current_spend",
+            new=AsyncMock(return_value=0.0),
+        ) as mock_get_spend:
+            with pytest.raises(HTTPException) as exc_info:
+                await handler.async_pre_call_hook(
+                    user_api_key_dict=user_api_key_dict,
+                    cache=DualCache(),
+                    data={"model": model},
+                    call_type="completion",
+                )
+
+    assert exc_info.value.status_code == 429
+    mock_get_spend.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_passthrough_unknown_model_does_not_skip_user_budget_check():
+    router = _make_router_for_budget_test(model="free-model", input_cost=0.0, output_cost=0.0)
+    handler = _PROXY_MaxBudgetLimiter(llm_router_getter=lambda: router)
+    user_api_key_dict = _make_user_api_key_auth(user_max_budget=0.0)
+
+    with patch(
+        "litellm.proxy.proxy_server.get_current_spend",
+        new=AsyncMock(return_value=0.0),
+    ) as mock_get_spend:
+        with pytest.raises(HTTPException) as exc_info:
+            await handler.async_pre_call_hook(
+                user_api_key_dict=user_api_key_dict,
+                cache=DualCache(),
+                data={"model": "provider/unknown-model"},
+                call_type="pass_through_endpoint",
+            )
+
+    assert exc_info.value.status_code == 429
+    mock_get_spend.assert_awaited_once()
