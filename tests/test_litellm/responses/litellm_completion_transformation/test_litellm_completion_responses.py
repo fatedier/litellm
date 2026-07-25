@@ -2992,6 +2992,119 @@ class TestStreamingIDConsistency:
         )
         assert tool_calls is not None and len(tool_calls) == 1
 
+    def test_assistant_content_between_tool_call_and_output_is_merged(self):
+        input_items = [
+            {
+                "type": "function_call",
+                "call_id": "call_01",
+                "name": "exec_command",
+                "arguments": '{"cmd":"pwd"}',
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Inspecting the directory."}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": ""},
+                    {"type": "output_text", "text": "The command is ready."},
+                ],
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_01",
+                "output": "/workspace",
+            },
+        ]
+
+        messages = LiteLLMCompletionResponsesConfig._transform_response_input_param_to_chat_completion_message(
+            input=input_items
+        )
+
+        assert [message.get("role") for message in messages] == ["assistant", "tool"]
+        assert len(messages[0].get("tool_calls", [])) == 1
+        assert messages[0].get("content") == [
+            {"type": "text", "text": "Inspecting the directory."},
+            {"type": "text", "text": "The command is ready."},
+        ]
+
+    @pytest.mark.parametrize(
+        ("assistant_contents", "expected_texts"),
+        [
+            (
+                ["FIRST_STRING", [{"type": "output_text", "text": "SECOND_ARRAY"}]],
+                ["FIRST_STRING", "SECOND_ARRAY"],
+            ),
+            (
+                [[{"type": "output_text", "text": "FIRST_ARRAY"}], "SECOND_STRING"],
+                ["FIRST_ARRAY", "SECOND_STRING"],
+            ),
+        ],
+        ids=["string-then-array", "array-then-string"],
+    )
+    def test_mixed_assistant_content_between_tool_call_and_output_is_normalized(
+        self,
+        assistant_contents: list[str | list[dict[str, str]]],
+        expected_texts: list[str],
+    ) -> None:
+        input_items = [
+            {
+                "type": "function_call",
+                "call_id": "call_01",
+                "name": "exec_command",
+                "arguments": '{"cmd":"pwd"}',
+            },
+            *[
+                {"type": "message", "role": "assistant", "content": content}
+                for content in assistant_contents
+            ],
+            {
+                "type": "function_call_output",
+                "call_id": "call_01",
+                "output": "/workspace",
+            },
+        ]
+
+        messages = LiteLLMCompletionResponsesConfig._transform_response_input_param_to_chat_completion_message(
+            input=input_items
+        )
+
+        assert [message.get("role") for message in messages] == ["assistant", "tool"]
+        assert messages[0].get("content") == [
+            {"type": "text", "text": text} for text in expected_texts
+        ]
+
+    def test_blank_assistant_between_tool_call_and_output_is_discarded(self):
+        input_items = [
+            {
+                "type": "function_call",
+                "call_id": "call_01",
+                "name": "exec_command",
+                "arguments": '{"cmd":"pwd"}',
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": ""}],
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_01",
+                "output": "/workspace",
+            },
+        ]
+
+        messages = LiteLLMCompletionResponsesConfig._transform_response_input_param_to_chat_completion_message(
+            input=input_items
+        )
+
+        assert [message.get("role") for message in messages] == ["assistant", "tool"]
+        assert len(messages[0].get("tool_calls", [])) == 1
+        assert messages[0].get("content") is None
+
 
 class TestCompletedResponseLatchedOnStreamEnd:
     """Regression: LiteLLMCompletionStreamingIterator (the Chat Completions
@@ -3071,6 +3184,74 @@ class TestCompletedResponseLatchedOnStreamEnd:
             "proxy container-ownership hook will see no terminal event"
         )
         assert iterator.completed_response.type == "response.completed"
+
+    def test_tool_only_completion_keeps_stream_and_completed_indices_aligned(self):
+        from litellm.types.utils import Choices, Function, Message, ModelResponse
+
+        complete_response = ModelResponse(
+            id="resp_tool_call",
+            created=1234567890,
+            model="deepseek-chat",
+            object="chat.completion",
+            choices=[
+                Choices(
+                    finish_reason="tool_calls",
+                    index=0,
+                    message=Message(
+                        content=None,
+                        role="assistant",
+                        tool_calls=[
+                            ChatCompletionMessageToolCall(
+                                id="call_1",
+                                type="function",
+                                function=Function(name="exec_command", arguments='{"cmd":"pwd"}'),
+                            )
+                        ],
+                    ),
+                )
+            ],
+        )
+        iterator = self._make_iterator_with_stop(complete_response)
+
+        import asyncio
+
+        async def drain():
+            results = []
+            async for event in iterator:
+                results.append(event)
+            return results
+
+        results = asyncio.run(drain())
+        event_types = [getattr(event, "type", None) for event in results]
+        completed_events = [event for event in results if getattr(event, "type", None) == "response.completed"]
+        message_done_events = [
+            event
+            for event in results
+            if getattr(event, "type", None) == "response.output_item.done"
+            and getattr(getattr(event, "item", None), "type", None) == "message"
+        ]
+        tool_done_events = [
+            event
+            for event in results
+            if getattr(event, "type", None) == "response.output_item.done"
+            and getattr(getattr(event, "item", None), "type", None) == "function_call"
+        ]
+
+        assert "response.output_item.done" in event_types
+        assert "response.completed" in event_types
+        assert "response.output_text.done" in event_types
+        assert "response.content_part.done" in event_types
+        assert len(message_done_events) == 1
+        assert message_done_events[0].output_index == 0
+        assert len(tool_done_events) == 1
+        assert tool_done_events[0].output_index == 1
+        assert len(completed_events) == 1
+        completed_output = completed_events[0].response.output
+        assert [item.type for item in completed_output] == ["message", "function_call"]
+        assert tool_done_events[0].item.call_id == completed_output[1].call_id
+        assert iterator.sent_output_text_done_event is True
+        assert iterator.sent_output_content_part_done_event is True
+        assert iterator.sent_output_item_done_event is True
 
 
 class TestFallbackWrapperStopAsyncIterationFallback:

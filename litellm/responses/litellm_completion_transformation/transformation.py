@@ -26,7 +26,7 @@ from openai.types.chat.chat_completion_named_tool_choice_param import (
 from openai.types.responses import ResponseFunctionToolCall
 from openai.types.responses.response_create_params import ResponseInputParam
 from openai.types.responses.tool_param import FunctionToolParam
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 from typing_extensions import TypedDict
 
 from litellm._logging import verbose_logger
@@ -124,6 +124,8 @@ class _HasToolCalls(Protocol):
 @runtime_checkable
 class _HasId(Protocol):
     id: object
+_ASSISTANT_CONTENT_PART_ADAPTER: Final = TypeAdapter(Mapping[str, object])
+_ASSISTANT_CONTENT_PARTS_ADAPTER: Final = TypeAdapter(tuple[object, ...])
 
 
 class ChatCompletionSession(TypedDict, total=False):
@@ -439,6 +441,30 @@ class LiteLLMCompletionResponsesConfig:
         return litellm_completion_request
 
     @staticmethod
+    def _normalize_assistant_content_for_merge(content: object) -> tuple[Mapping[str, object], ...]:
+        def normalize_part(part: object) -> Mapping[str, object] | None:
+            if isinstance(part, str):
+                return {"type": "text", "text": part} if part.strip() else None
+            try:
+                part_mapping = _ASSISTANT_CONTENT_PART_ADAPTER.validate_python(part)
+            except ValidationError:
+                return None
+            if part_mapping.get("type") not in ("text", "output_text"):
+                return part_mapping
+            text = part_mapping.get("text")
+            if not isinstance(text, str) or not text.strip():
+                return None
+            return {**part_mapping, "type": "text", "text": text}
+
+        try:
+            parts = (
+                _ASSISTANT_CONTENT_PARTS_ADAPTER.validate_python(content) if isinstance(content, list) else (content,)
+            )
+        except ValidationError:
+            return ()
+        return tuple(normalized for part in parts if (normalized := normalize_part(part)) is not None)
+
+    @staticmethod
     def _transform_response_input_param_to_chat_completion_message(
         input: str | ResponseInputParam,
     ) -> list[
@@ -464,6 +490,32 @@ class LiteLLMCompletionResponsesConfig:
                         input_item=_input
                     )
                 )
+
+                if (
+                    messages
+                    and len(chat_completion_messages) == 1
+                    and not LiteLLMCompletionResponsesConfig._is_input_item_function_call(input_item=_input)
+                    and not LiteLLMCompletionResponsesConfig._is_input_item_tool_call_output(input_item=_input)
+                ):
+                    last_msg = messages[-1]
+                    new_msg = chat_completion_messages[0]
+                    if (
+                        isinstance(last_msg, dict)
+                        and isinstance(new_msg, dict)
+                        and last_msg.get("role") == "assistant"
+                        and last_msg.get("tool_calls")
+                        and new_msg.get("role") == "assistant"
+                    ):
+                        last_content = LiteLLMCompletionResponsesConfig._normalize_assistant_content_for_merge(
+                            last_msg.get("content")
+                        )
+                        new_content = LiteLLMCompletionResponsesConfig._normalize_assistant_content_for_merge(
+                            new_msg.get("content")
+                        )
+                        if not new_content:
+                            continue
+                        last_msg["content"] = [*last_content, *new_content]
+                        continue
 
                 if LiteLLMCompletionResponsesConfig._is_input_item_function_call(input_item=_input):
                     call_id_raw = _input.get("call_id") or _input.get("id") or ""
