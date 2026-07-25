@@ -12,9 +12,7 @@ from typing import Any, Literal, Optional
 
 import pytest
 
-sys.path.insert(
-    0, os.path.abspath("../../../../../../..")
-)  # Adds the parent directory to the system path
+sys.path.insert(0, os.path.abspath("../../../../../../.."))  # Adds the parent directory to the system path
 
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.llms.openai.chat.guardrail_translation.handler import (
@@ -147,6 +145,60 @@ class MockMisalignedToolCallGuardrail(CustomGuardrail):
         )
 
 
+class TestOpenAIChatCompletionsHandlerImages:
+    @pytest.mark.asyncio
+    async def test_image_only_request_is_sent_to_guardrail(self):
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = MockGuardrail()
+        image = "data:image/png;base64,aGVsbG8="
+        data = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": image}}],
+                }
+            ]
+        }
+
+        await handler.process_input_messages(data, guardrail)
+
+        assert guardrail.last_inputs is not None
+        assert guardrail.last_inputs.get("texts") == []
+        assert guardrail.last_inputs.get("images") == [image]
+
+    @pytest.mark.asyncio
+    async def test_image_only_response_is_sent_to_guardrail(self):
+        handler = OpenAIChatCompletionsHandler()
+        guardrail = MockGuardrail()
+        image = "data:image/png;base64,aGVsbG8="
+        response = ModelResponse(
+            model="gpt-4",
+            choices=[
+                Choices(
+                    finish_reason="stop",
+                    index=0,
+                    message=Message(
+                        content=None,
+                        role="assistant",
+                        images=[
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": image},
+                                "index": 0,
+                            }
+                        ],
+                    ),
+                )
+            ],
+        )
+
+        await handler.process_output_response(response, guardrail)
+
+        assert guardrail.last_inputs is not None
+        assert guardrail.last_inputs.get("texts") == []
+        assert guardrail.last_inputs.get("images") == [image]
+
+
 class TestOpenAIChatCompletionsHandlerToolsInput:
     """Test input processing with tools (function definitions)"""
 
@@ -197,9 +249,7 @@ class TestOpenAIChatCompletionsHandlerToolsInput:
         tool = guardrail.last_inputs["tools"][0]
         assert tool["type"] == "function"
         assert tool["function"]["name"] == "get_weather"
-        assert (
-            tool["function"]["description"] == "Get the current weather in a location"
-        )
+        assert tool["function"]["description"] == "Get the current weather in a location"
         assert "parameters" in tool["function"]
 
     @pytest.mark.asyncio
@@ -254,10 +304,7 @@ class TestOpenAIChatCompletionsHandlerToolsInput:
 
         assert guardrail.last_inputs is not None
         # tools should not be in inputs if not provided
-        assert (
-            "tools" not in guardrail.last_inputs
-            or guardrail.last_inputs.get("tools") is None
-        )
+        assert "tools" not in guardrail.last_inputs or guardrail.last_inputs.get("tools") is None
 
     @pytest.mark.asyncio
     async def test_tools_and_tool_calls_both_passed(self):
@@ -329,9 +376,7 @@ class TestOpenAIChatCompletionsHandlerToolCallsInput:
                             "type": "function",
                             "function": {
                                 "name": "get_weather",
-                                "arguments": json.dumps(
-                                    {"location": "San Francisco", "unit": "celsius"}
-                                ),
+                                "arguments": json.dumps({"location": "San Francisco", "unit": "celsius"}),
                             },
                         }
                     ],
@@ -405,10 +450,7 @@ class TestOpenAIChatCompletionsHandlerToolCallsInput:
 
         # Should have 1 tool call
         assert len(guardrail.last_inputs["tool_calls"]) == 1
-        assert (
-            guardrail.last_inputs["tool_calls"][0]["function"]["name"]
-            == "get_current_weather"
-        )
+        assert guardrail.last_inputs["tool_calls"][0]["function"]["name"] == "get_current_weather"
 
         # Verify text content was modified
         assert data["messages"][0]["content"] == "WHAT'S THE WEATHER?"
@@ -648,9 +690,7 @@ class TestOpenAIChatCompletionsHandlerToolCallsOutput:
                                 type="function",
                                 function=Function(
                                     name="web_search",
-                                    arguments=json.dumps(
-                                        {"keywords": "litellm documentation"}
-                                    ),
+                                    arguments=json.dumps({"keywords": "litellm documentation"}),
                                 ),
                             )
                         ],
@@ -673,9 +713,7 @@ class TestOpenAIChatCompletionsHandlerToolCallsOutput:
         assert len(guardrail.last_inputs["tool_calls"]) == 1
 
         # Verify both were modified
-        assert (
-            response.choices[0].message.content == "I'LL SEARCH FOR THAT INFORMATION."
-        )
+        assert response.choices[0].message.content == "I'LL SEARCH FOR THAT INFORMATION."
         response_tool_call = response.choices[0].message.tool_calls[0]
         args = json.loads(response_tool_call.function.arguments)
         assert args["keywords"] == "LITELLM DOCUMENTATION"
@@ -865,9 +903,7 @@ class TestOpenAIChatCompletionsHandlerToolCallsOutput:
                             ChatCompletionMessageToolCall(
                                 id="call_email",
                                 type="function",
-                                function=Function(
-                                    name="send_email", arguments=original
-                                ),
+                                function=Function(name="send_email", arguments=original),
                             )
                         ],
                     ),
@@ -905,16 +941,12 @@ class TestOpenAIChatCompletionsHandlerToolCallsOutput:
                             ChatCompletionMessageToolCall(
                                 id="call_1",
                                 type="function",
-                                function=Function(
-                                    name="send_email", arguments=first_args
-                                ),
+                                function=Function(name="send_email", arguments=first_args),
                             ),
                             ChatCompletionMessageToolCall(
                                 id="call_2",
                                 type="function",
-                                function=Function(
-                                    name="send_email", arguments=second_args
-                                ),
+                                function=Function(name="send_email", arguments=second_args),
                             ),
                         ],
                     ),

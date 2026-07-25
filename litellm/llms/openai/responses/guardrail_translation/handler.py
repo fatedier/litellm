@@ -50,6 +50,7 @@ from litellm.types.llms.openai import (
 from litellm.types.responses.main import (
     GenericResponseOutputItem,
     OutputFunctionToolCall,
+    OutputImageGenerationCall,
     OutputText,
 )
 from litellm.types.utils import GenericGuardrailAPIInputs
@@ -159,7 +160,7 @@ class OpenAIResponsesHandler(BaseTranslation):
             self._extract_and_transform_tools(data["tools"], tools_to_check)
 
         # Step 2: Apply guardrail to all texts in batch
-        if texts_to_check:
+        if texts_to_check or images_to_check:
             inputs = GenericGuardrailAPIInputs(texts=texts_to_check)
             if images_to_check:
                 inputs["images"] = images_to_check
@@ -310,12 +311,16 @@ class OpenAIResponsesHandler(BaseTranslation):
                         task_mappings.append((msg_idx, int(content_idx)))
 
                     # Extract images
-                    if content_item.get("type") == "image_url":
+                    if content_item.get("type") in {"image_url", "input_image"}:
+                        # Provider file_id references intentionally pass through: the moderation service cannot
+                        # resolve opaque provider files, and unsupported image shapes must not block valid requests.
                         image_url = content_item.get("image_url", {})
                         if isinstance(image_url, dict):
                             url = image_url.get("url")
                             if url:
                                 images_to_check.append(url)
+                        elif isinstance(image_url, str):
+                            images_to_check.append(image_url)
 
     async def _apply_guardrail_responses_to_input(
         self,
@@ -405,7 +410,7 @@ class OpenAIResponsesHandler(BaseTranslation):
             )
 
         # Step 2: Apply guardrail to all texts in batch
-        if texts_to_check or tool_calls_to_check:
+        if texts_to_check or images_to_check or tool_calls_to_check:
             # Use the real request_data if provided (proxy path), otherwise
             # create a standalone dict (SDK / direct-call path).
             if request_data is None:
@@ -494,6 +499,7 @@ class OpenAIResponsesHandler(BaseTranslation):
             outputs: Final[list[Any]] = response_obj.get("output") or []
 
             texts_to_check: Final[list[str]] = []
+            images_to_check: Final[list[str]] = []
             tool_calls_to_check: Final[list[ChatCompletionToolCallChunk]] = []
             task_mappings: Final[list[tuple[int, int]]] = []
 
@@ -502,12 +508,12 @@ class OpenAIResponsesHandler(BaseTranslation):
                     output_item=output_item,
                     output_idx=output_idx,
                     texts_to_check=texts_to_check,
-                    images_to_check=[],
+                    images_to_check=images_to_check,
                     task_mappings=task_mappings,
                     tool_calls_to_check=tool_calls_to_check,
                 )
 
-            if texts_to_check or tool_calls_to_check:
+            if texts_to_check or images_to_check or tool_calls_to_check:
                 if request_data is None:
                     request_data = {}
                 if "response" not in request_data:
@@ -518,6 +524,8 @@ class OpenAIResponsesHandler(BaseTranslation):
                         request_data["litellm_metadata"] = user_metadata
 
                 inputs = GenericGuardrailAPIInputs(texts=texts_to_check)
+                if images_to_check:
+                    inputs["images"] = images_to_check
                 if tool_calls_to_check:
                     inputs["tool_calls"] = cast(list[ChatCompletionToolCallChunk], tool_calls_to_check)
                 response_model = response_obj.get("model")
@@ -654,8 +662,32 @@ class OpenAIResponsesHandler(BaseTranslation):
         Override this method to customize text/image/tool extraction logic.
         """
 
-        # Check if this is a tool call (OutputFunctionToolCall)
-        if isinstance(output_item, OutputFunctionToolCall) or (
+        if isinstance(output_item, OutputImageGenerationCall):
+            if output_item.result:
+                images_to_check.append(output_item.result)
+            return
+        if isinstance(output_item, BaseModel) and getattr(output_item, "type", None) == "image_generation_call":
+            image_result = getattr(output_item, "result", None)
+            if isinstance(image_result, str) and image_result:
+                images_to_check.append(image_result)
+            return
+        if isinstance(output_item, dict) and output_item.get("type") == "image_generation_call":
+            image_result = output_item.get("result")
+            if isinstance(image_result, str) and image_result:
+                images_to_check.append(image_result)
+            return
+
+        if isinstance(output_item, OutputFunctionToolCall):
+            if tool_calls_to_check is not None:
+                tool_call_dict = (
+                    LiteLLMCompletionResponsesConfig.convert_response_function_tool_call_to_chat_completion_tool_call(
+                        tool_call_item=output_item,
+                        index=output_idx,
+                    )
+                )
+                tool_calls_to_check.append(cast(ChatCompletionToolCallChunk, tool_call_dict))
+            return
+        elif (
             isinstance(output_item, BaseModel)
             and hasattr(output_item, "type")
             and getattr(output_item, "type") == "function_call"
@@ -715,6 +747,11 @@ class OpenAIResponsesHandler(BaseTranslation):
                 text_content = content_item.text
             elif isinstance(content_item, dict):
                 text_content = content_item.get("text")
+                image_url = content_item.get("image_url")
+                if isinstance(image_url, dict):
+                    image_url = image_url.get("url")
+                if isinstance(image_url, str) and image_url:
+                    images_to_check.append(image_url)
             else:
                 continue
 

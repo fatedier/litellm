@@ -227,8 +227,20 @@ def get_logging_payload(kwargs, response_obj, start_time, end_time) -> SpendLogs
     # standardize this function to be used across, s3, dynamoDB, langfuse logging
     litellm_params: Final = kwargs.get("litellm_params", {})
     metadata: Final = get_litellm_metadata_from_kwargs(kwargs)
+    standard_logging_payload = cast(StandardLoggingPayload | None, kwargs.get("standard_logging_object", None))
+    standard_logging_call_type = standard_logging_payload.get("call_type", "") if standard_logging_payload else ""
+    standard_logging_model_id = standard_logging_payload.get("model_id", "") if standard_logging_payload else ""
+    standard_logging_model_group = standard_logging_payload.get("model_group", "") if standard_logging_payload else ""
+    standard_logging_model = standard_logging_payload.get("model", "") if standard_logging_payload else ""
+    standard_logging_api_base = standard_logging_payload.get("api_base", "") if standard_logging_payload else ""
+    standard_logging_custom_llm_provider = (
+        standard_logging_payload.get("custom_llm_provider", "") if standard_logging_payload else ""
+    )
+    standard_logging_requester_ip_address = (
+        standard_logging_payload.get("requester_ip_address") if standard_logging_payload else None
+    )
     completion_start_time: Final = kwargs.get("completion_start_time", end_time)
-    call_type: Final = kwargs.get("call_type")
+    call_type: Final = kwargs.get("call_type") or standard_logging_call_type
     cache_hit: Final = kwargs.get("cache_hit", False)
 
     # Convert response_obj to dict first
@@ -259,8 +271,6 @@ def get_logging_payload(kwargs, response_obj, start_time, end_time) -> SpendLogs
         usage = _combined_usage.model_dump()
 
     id = get_spend_logs_id(call_type or "acompletion", response_obj_dict, kwargs)
-    standard_logging_payload: Final = cast(StandardLoggingPayload | None, kwargs.get("standard_logging_object", None))
-
     end_user_id = get_end_user_id_for_cost_tracking(litellm_params)
 
     api_key = metadata.get("user_api_key", "")
@@ -288,8 +298,8 @@ def get_logging_payload(kwargs, response_obj, start_time, end_time) -> SpendLogs
     ):  # use 'tags' from standard logging payload instead
         request_tags = safe_dumps(standard_logging_payload["request_tags"])
 
-    _model_id: Final = metadata.get("model_info", {}).get("id", "")
-    _model_group: Final = metadata.get("model_group", "")
+    _model_id: Final = metadata.get("model_info", {}).get("id", "") or standard_logging_model_id
+    _model_group: Final = metadata.get("model_group", "") or standard_logging_model_group
 
     # Extract overhead from hidden_params if available
     litellm_overhead_time_ms = None
@@ -389,9 +399,9 @@ def get_logging_payload(kwargs, response_obj, start_time, end_time) -> SpendLogs
 
     # Extract agent_id for A2A requests (set directly on model_call_details)
     agent_id: Final[str | None] = kwargs.get("agent_id") or metadata.get("agent_id")
-    custom_llm_provider: Final = kwargs.get("custom_llm_provider")
+    custom_llm_provider: Final = kwargs.get("custom_llm_provider") or standard_logging_custom_llm_provider
     raw_model: Final = cast(str, kwargs.get("model") or "")
-    model_name: Final = reconstruct_model_name(raw_model, custom_llm_provider, metadata or {})
+    model_name: Final = standard_logging_model or reconstruct_model_name(raw_model, custom_llm_provider, metadata or {})
 
     try:
         payload: Final[SpendLogsPayload] = SpendLogsPayload(
@@ -414,13 +424,14 @@ def get_logging_payload(kwargs, response_obj, start_time, end_time) -> SpendLogs
             completion_tokens=usage.get("completion_tokens", standard_logging_completion_tokens),
             request_tags=request_tags,
             end_user=end_user_id or "",
-            api_base=litellm_params.get("api_base", ""),
+            api_base=litellm_params.get("api_base", "") or standard_logging_api_base,
             model_group=_model_group,
             model_id=_model_id,
             mcp_namespaced_tool_name=mcp_namespaced_tool_name,
             agent_id=agent_id,
-            requester_ip_address=clean_metadata.get("requester_ip_address", None),
-            custom_llm_provider=kwargs.get("custom_llm_provider", ""),
+            requester_ip_address=clean_metadata.get("requester_ip_address", None)
+            or standard_logging_requester_ip_address,
+            custom_llm_provider=custom_llm_provider or "",
             messages=_get_messages_for_spend_logs_payload(
                 standard_logging_payload=standard_logging_payload, metadata=metadata
             ),

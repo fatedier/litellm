@@ -110,7 +110,7 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
             )
 
         # Step 2: Apply guardrail to all texts and tool calls in batch
-        if texts_to_check or tool_calls_to_check:
+        if texts_to_check or images_to_check or tool_calls_to_check:
             inputs: Final = GenericGuardrailAPIInputs(texts=texts_to_check)
             if images_to_check:
                 inputs["images"] = images_to_check
@@ -372,7 +372,7 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
             )
 
         # Step 2: Apply guardrail to all texts and tool calls in batch
-        if texts_to_check or tool_calls_to_check:
+        if texts_to_check or images_to_check or tool_calls_to_check:
             # Use the real request_data if provided (proxy path), otherwise
             # create a standalone dict (SDK / direct-call path).
             if request_data is None:
@@ -751,10 +751,21 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         if isinstance(response, ModelResponse):
             for choice in response.choices:
                 if isinstance(choice, litellm.Choices):
-                    # Check for text content
-                    if choice.message.content and isinstance(choice.message.content, str):
+                    content = cast(Union[str, list[object], None], choice.message.content)
+                    if content and isinstance(content, str):
                         return True
-                    # Check for tool calls
+                    if (
+                        content
+                        and isinstance(content, list)
+                        and any(
+                            isinstance(content_item, dict)
+                            and (content_item.get("text") or content_item.get("type") == "image_url")
+                            for content_item in content
+                        )
+                    ):
+                        return True
+                    if choice.message.get("images"):
+                        return True
                     if choice.message.tool_calls and isinstance(choice.message.tool_calls, list):
                         if len(choice.message.tool_calls) > 0:
                             return True
@@ -790,12 +801,15 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         # Determine content source and tool calls based on choice type
         content = None
         tool_calls: list[Any] | None = None
+        response_images = None
         if isinstance(choice, litellm.Choices):
             content = choice.message.content
             tool_calls = choice.message.tool_calls
+            response_images = choice.message.get("images")
         elif isinstance(choice, litellm.StreamingChoices):
             content = choice.delta.content
             tool_calls = choice.delta.tool_calls
+            response_images = choice.delta.get("images")
         else:
             # Unknown choice type, skip processing
             return
@@ -822,6 +836,16 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                         url = image_url.get("url")
                         if url:
                             images_to_check.append(url)
+                    elif isinstance(image_url, str):
+                        images_to_check.append(image_url)
+
+        if response_images:
+            for image in response_images:
+                image_url = image.get("image_url")
+                if isinstance(image_url, dict):
+                    url = image_url.get("url")
+                    if url:
+                        images_to_check.append(url)
 
         # Process tool calls if they exist
         if tool_calls is not None and isinstance(tool_calls, list):

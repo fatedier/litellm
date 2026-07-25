@@ -79,6 +79,7 @@ guardrails:
 
 
 class SupportedGuardrailIntegrations(Enum):
+    AIGATEWAY_MODERATION = "aigateway_moderation"
     APORIA = "aporia"
     BEDROCK = "bedrock"
     DYNAMOAI = "dynamoai"

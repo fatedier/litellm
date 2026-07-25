@@ -21,6 +21,9 @@ from litellm.constants import (
     LITELLM_TRUNCATION_DB_SAFEGUARD_NOTE,
     REDACTED_BY_LITELM_STRING,
 )
+from litellm.litellm_core_utils.litellm_logging import (
+    create_dummy_standard_logging_payload,
+)
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.proxy.spend_tracking.spend_tracking_utils import (
     _get_messages_for_spend_logs_payload,
@@ -865,6 +868,46 @@ def test_get_logging_payload_api_key_preserved_when_standard_logging_payload_is_
     assert payload["user"] == "test_user"
 
     print(f"✅ Test passed! api_key preserved: {payload['api_key']}")
+
+
+def test_get_logging_payload_uses_standard_fields_with_dual_metadata() -> None:
+    standard_logging_payload = create_dummy_standard_logging_payload()
+    standard_logging_payload["model_group"] = "text-embedding-3-small"
+    standard_logging_payload["model_id"] = "deployment-123"
+    standard_logging_payload["model"] = "azure/text-embedding-3-small"
+    standard_logging_payload["call_type"] = "aembedding"
+    standard_logging_payload["api_base"] = "https://example.openai.azure.com"
+    standard_logging_payload["custom_llm_provider"] = "azure"
+    standard_logging_payload["requester_ip_address"] = "203.0.113.10"
+    kwargs = {
+        "model": "text-embedding-3-small",
+        "litellm_params": {
+            "litellm_metadata": {
+                "user_api_key": "sk-test-key",
+                "user_api_key_user_id": "test-user",
+            },
+        },
+        "standard_logging_object": standard_logging_payload,
+    }
+    now = datetime.datetime.now(timezone.utc)
+
+    payload = get_logging_payload(
+        kwargs=kwargs,
+        response_obj={
+            "id": "embedding-response-123",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1},
+        },
+        start_time=now,
+        end_time=now,
+    )
+
+    assert payload["model_group"] == "text-embedding-3-small"
+    assert payload["model_id"] == "deployment-123"
+    assert payload["model"] == "azure/text-embedding-3-small"
+    assert payload["call_type"] == "aembedding"
+    assert payload["api_base"] == "https://example.openai.azure.com"
+    assert payload["custom_llm_provider"] == "azure"
+    assert payload["requester_ip_address"] == "203.0.113.10"
 
 
 @pytest.mark.asyncio

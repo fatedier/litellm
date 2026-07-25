@@ -8,13 +8,10 @@ with guardrail transformations.
 import os
 import sys
 from typing import Any, List, Literal, Optional, Tuple
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-sys.path.insert(
-    0, os.path.abspath("../../../../../..")
-)  # Adds the parent directory to the system path
+sys.path.insert(0, os.path.abspath("../../../../../.."))  # Adds the parent directory to the system path
 
 from fastapi import HTTPException
 from openai.types.responses import ResponseFunctionToolCall
@@ -25,12 +22,16 @@ from litellm.llms.openai.responses.guardrail_translation.handler import (
     OpenAIResponsesHandler,
 )
 from litellm.types.llms.openai import ResponsesAPIResponse
-from litellm.types.responses.main import GenericResponseOutputItem, OutputText
+from litellm.types.responses.main import GenericResponseOutputItem, OutputImageGenerationCall, OutputText
 from litellm.types.utils import CallTypes, GenericGuardrailAPIInputs
 
 
 class MockGuardrail(CustomGuardrail):
     """Mock guardrail for testing that transforms text for requests and blocks responses"""
+
+    def __init__(self, guardrail_name: str):
+        super().__init__(guardrail_name=guardrail_name)
+        self.last_inputs: Optional[GenericGuardrailAPIInputs] = None
 
     async def apply_guardrail(
         self,
@@ -43,6 +44,7 @@ class MockGuardrail(CustomGuardrail):
         For requests: Append [GUARDRAILED] to text
         For responses: Block by raising HTTPException (masking responses is no longer supported)
         """
+        self.last_inputs = inputs
         texts = inputs.get("texts", [])
         if input_type == "response":
             # Responses should be blocked, not masked
@@ -151,15 +153,31 @@ class TestOpenAIResponsesHandlerInputProcessing:
 
         result = await handler.process_input_messages(data, guardrail)
 
-        assert (
-            result["input"][0]["content"][0]["text"]
-            == "Describe this image [GUARDRAILED]"
-        )
+        assert result["input"][0]["content"][0]["text"] == "Describe this image [GUARDRAILED]"
         # Image URL should remain unchanged
-        assert (
-            result["input"][0]["content"][1]["image_url"]["url"]
-            == "https://example.com/image.jpg"
-        )
+        assert result["input"][0]["content"][1]["image_url"]["url"] == "https://example.com/image.jpg"
+
+    @pytest.mark.asyncio
+    async def test_process_input_with_only_image(self):
+        handler = OpenAIResponsesHandler()
+        guardrail = MockGuardrail(guardrail_name="test")
+        image = "data:image/png;base64,aGVsbG8="
+        data = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_image", "image_url": image}],
+                    "type": "message",
+                }
+            ],
+            "model": "gpt-4",
+        }
+
+        await handler.process_input_messages(data, guardrail)
+
+        assert guardrail.last_inputs is not None
+        assert guardrail.last_inputs.get("texts") == []
+        assert guardrail.last_inputs.get("images") == [image]
 
     @pytest.mark.asyncio
     async def test_process_input_with_empty_content(self):
@@ -363,6 +381,34 @@ class TestOpenAIResponsesHandlerOutputProcessing:
 
         # Should return unchanged response
         assert result == response
+
+    @pytest.mark.asyncio
+    async def test_process_output_response_with_only_image(self):
+        handler = OpenAIResponsesHandler()
+        guardrail = MockGuardrail(guardrail_name="test")
+        image = "aGVsbG8="
+        response = ResponsesAPIResponse(
+            id="resp_123",
+            created_at=1234567890,
+            model="gpt-4",
+            object="response",
+            status="completed",
+            output=[
+                OutputImageGenerationCall(
+                    type="image_generation_call",
+                    id="img_123",
+                    status="completed",
+                    result=image,
+                )
+            ],
+        )
+
+        with pytest.raises(HTTPException):
+            await handler.process_output_response(response, guardrail)
+
+        assert guardrail.last_inputs is not None
+        assert guardrail.last_inputs.get("texts") == []
+        assert guardrail.last_inputs.get("images") == [image]
 
 
 class TestOpenAIResponsesHandlerHelperMethods:
@@ -577,10 +623,7 @@ class TestOpenAIResponsesHandlerToolCallExtraction:
         assert tool_call["id"] == "call_4SjsMeA6DUHwGKaE87ZojgOF"
         assert tool_call["type"] == "function"
         assert tool_call["function"]["name"] == "get_current_weather"
-        assert (
-            tool_call["function"]["arguments"]
-            == '{"location":"Boston, MA","unit":"celsius"}'
-        )
+        assert tool_call["function"]["arguments"] == '{"location":"Boston, MA","unit":"celsius"}'
         assert tool_call["index"] == 0
 
     def test_extract_tool_call_from_dict_format(self):
@@ -621,10 +664,7 @@ class TestOpenAIResponsesHandlerToolCallExtraction:
         assert tool_call["id"] == "call_4SjsMeA6DUHwGKaE87ZojgOF"
         assert tool_call["type"] == "function"
         assert tool_call["function"]["name"] == "get_current_weather"
-        assert (
-            tool_call["function"]["arguments"]
-            == '{"location":"Boston, MA","unit":"celsius"}'
-        )
+        assert tool_call["function"]["arguments"] == '{"location":"Boston, MA","unit":"celsius"}'
 
     @pytest.mark.asyncio
     async def test_process_output_response_with_tool_calls(self):
@@ -1011,6 +1051,41 @@ class TestOpenAIResponsesHandlerStreamingOutputProcessing:
         assert result == responses_so_far
 
     @pytest.mark.asyncio
+    async def test_process_output_streaming_response_with_only_image(self):
+        handler = OpenAIResponsesHandler()
+        guardrail = MockGuardrail(guardrail_name="test")
+        image = "aGVsbG8="
+        responses_so_far = [
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_123",
+                    "model": "gpt-4",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "image_generation_call",
+                            "id": "img_123",
+                            "status": "completed",
+                            "result": image,
+                        }
+                    ],
+                },
+            }
+        ]
+
+        with pytest.raises(HTTPException):
+            await handler.process_output_streaming_response(
+                responses_so_far=responses_so_far,
+                guardrail_to_apply=guardrail,
+                litellm_logging_obj=None,
+            )
+
+        assert guardrail.last_inputs is not None
+        assert guardrail.last_inputs.get("texts") == []
+        assert guardrail.last_inputs.get("images") == [image]
+
+    @pytest.mark.asyncio
     async def test_process_output_streaming_response_writes_back_guardrailed_text(self):
         """Guardrailed text must be written back into the response.completed chunk in-place."""
 
@@ -1025,9 +1100,7 @@ class TestOpenAIResponsesHandlerStreamingOutputProcessing:
                 logging_obj: Optional[Any] = None,
             ) -> GenericGuardrailAPIInputs:
                 texts = inputs.get("texts", [])
-                inputs["texts"] = [
-                    t.replace("<TOKEN_1>", "john@example.com") for t in texts
-                ]
+                inputs["texts"] = [t.replace("<TOKEN_1>", "john@example.com") for t in texts]
                 return inputs
 
         handler = OpenAIResponsesHandler()
@@ -1063,15 +1136,11 @@ class TestOpenAIResponsesHandlerStreamingOutputProcessing:
             litellm_logging_obj=None,
         )
 
-        completed_chunk = next(
-            c
-            for c in result
-            if isinstance(c, dict) and c.get("type") == "response.completed"
-        )
+        completed_chunk = next(c for c in result if isinstance(c, dict) and c.get("type") == "response.completed")
         output_text = completed_chunk["response"]["output"][0]["content"][0]["text"]
-        assert (
-            output_text == "send to john@example.com"
-        ), f"Expected PII token to be unmasked in response.completed output, got: {output_text!r}"
+        assert output_text == "send to john@example.com", (
+            f"Expected PII token to be unmasked in response.completed output, got: {output_text!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_process_output_streaming_response_pass_through_unchanged(self):
@@ -1150,9 +1219,7 @@ class TestGetStructuredMessages:
         }
         result = handler.get_structured_messages(data)
         assert result is not None
-        has_system = any(
-            isinstance(msg, dict) and msg.get("role") == "system" for msg in result
-        )
+        has_system = any(isinstance(msg, dict) and msg.get("role") == "system" for msg in result)
         assert has_system, f"Expected system message from instructions, got: {result}"
 
     def test_should_return_none_when_no_input(self):

@@ -1,0 +1,13 @@
+guardrails:
+  - guardrail_name: aigateway-moderation
+    litellm_params:
+      guardrail: aigateway_moderation
+      mode:
+        - pre_call
+        - post_call
+      api_base: http://aigateway-moderation:9800
+      api_key: os.environ/AIGATEWAY_MODERATION_API_KEY
+      default_on: true
+      fail_on_error: true
+      optional_params:
+        decision_timeout_seconds: 5

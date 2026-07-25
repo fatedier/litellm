@@ -7,6 +7,7 @@
 
 import fnmatch
 import os
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional
 
 import httpx
@@ -201,11 +202,12 @@ class GenericGuardrailAPI(CustomGuardrail):
             )
 
         # Append the endpoint path if not already present
-        if not base_url.endswith("/beta/litellm_basic_guardrail_api"):
-            base_url = base_url.rstrip("/")
-            self.api_base = f"{base_url}/beta/litellm_basic_guardrail_api"
-        else:
-            self.api_base = base_url
+        normalized_base_url = base_url.rstrip("/")
+        self.api_base = (
+            normalized_base_url
+            if normalized_base_url.endswith("/beta/litellm_basic_guardrail_api")
+            else f"{normalized_base_url}/beta/litellm_basic_guardrail_api"
+        )
 
         self.additional_provider_specific_params = additional_provider_specific_params or {}
 
@@ -338,6 +340,15 @@ class GenericGuardrailAPI(CustomGuardrail):
             return_inputs["stream_holdback_chars"] = guardrail_response.stream_holdback_chars
         return return_inputs
 
+    def _validate_guardrail_response(
+        self,
+        response_json: object,
+        input_type: Literal["request", "response"],
+        request_data: Mapping[str, object],
+        inputs: GenericGuardrailAPIInputs,
+    ) -> None:
+        return None
+
     def _handle_guardrail_request_error(
         self,
         error: Exception,
@@ -453,6 +464,7 @@ class GenericGuardrailAPI(CustomGuardrail):
 
             verbose_proxy_logger.debug("Generic Guardrail API response: %s", response_json)
 
+            self._validate_guardrail_response(response_json, input_type, request_data, inputs)
             guardrail_response: Final = GenericGuardrailAPIResponse.from_dict(response_json)
 
             # Handle the response
