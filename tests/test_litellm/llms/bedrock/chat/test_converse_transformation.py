@@ -5766,6 +5766,23 @@ def test_converse_top_k_forwarded_on_models_that_accept_it():
     assert result["additionalModelRequestFields"]["top_k"] == 40
 
 
+def test_converse_client_metadata_is_not_forwarded_to_model():
+    config = AmazonConverseConfig()
+
+    result = config.transform_request(
+        model="us.anthropic.claude-sonnet-4-6",
+        messages=[{"role": "user", "content": "hello"}],
+        optional_params={
+            "client_metadata": {"originator": "codex"},
+            "top_k": 40,
+        },
+        litellm_params={"drop_params": True},
+        headers={},
+    )
+
+    assert result["additionalModelRequestFields"] == {"top_k": 40}
+
+
 def test_converse_top_k_zero_raises_without_drop_params(monkeypatch):
     """``top_k=0`` must hit the same gating as any other value; previously the
     truthiness check let it silently disappear on models that removed sampling

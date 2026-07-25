@@ -1317,6 +1317,7 @@ class AmazonConverseConfig(BaseConfig):
         # from additional_request_params to prevent JSON serialization errors
         # This filters: Exception objects, callable objects (functions), Logging objects, etc.
         additional_request_params = filter_exceptions_from_params(additional_request_params)
+        additional_request_params.pop("client_metadata", None)
 
         if anthropic_output_config is not None and isinstance(anthropic_output_config, dict):
             # Application inference profile ARNs hide the underlying model, so the
