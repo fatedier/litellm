@@ -9,7 +9,7 @@ Pins (PR2):
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -94,6 +94,172 @@ def configured_router(monkeypatch):
     monkeypatch.setattr(proxy_server, "user_model", None)
     monkeypatch.setattr(proxy_server, "_get_proxy_model_info", lambda model: model)
     yield router
+
+
+@pytest.fixture
+def metadata_router(monkeypatch, mock_prisma):
+    deployment_dict = {
+        "model_name": "default-effort-model",
+        "litellm_params": {"model": "default-effort-model"},
+        "model_info": {"id": "default-effort-id", "db_model": False},
+    }
+    deployment = MagicMock()
+    deployment.model_dump = MagicMock(return_value=deployment_dict)
+    router = MagicMock()
+    router.model_list = [deployment_dict]
+    router.get_deployment = MagicMock(return_value=deployment)
+    router.get_model_info = MagicMock(return_value=deployment_dict)
+    router.get_model_list_from_model_alias = MagicMock(return_value=[])
+    proxy_config = MagicMock()
+    proxy_config.get_config = AsyncMock(return_value={})
+
+    async def preserve_models(models, user_api_key_dict):
+        return models
+
+    from litellm.proxy.agent_endpoints import model_list_helpers
+
+    monkeypatch.setattr(model_list_helpers, "append_agents_to_model_info", preserve_models)
+    monkeypatch.setattr(proxy_server, "llm_router", router)
+    monkeypatch.setattr(proxy_server, "llm_model_list", [deployment_dict])
+    monkeypatch.setattr(proxy_server, "user_model", None)
+    monkeypatch.setattr(proxy_server, "prisma_client", mock_prisma)
+    monkeypatch.setattr(proxy_server, "proxy_config", proxy_config)
+    yield router
+
+
+@pytest.mark.parametrize(
+    ("path", "params"),
+    [
+        ("/model/info", {"litellm_model_id": "default-effort-id"}),
+        ("/v2/model/info", {"modelId": "default-effort-id"}),
+    ],
+)
+@pytest.mark.parametrize(
+    "catalog_model_info",
+    [
+        {"default_effort": "vendor-defined"},
+        {},
+        {"default_effort": None},
+    ],
+    ids=["string", "missing", "explicit-null"],
+)
+def test_model_info_routes_preserve_default_effort_key_presence(
+    client,
+    auth_as,
+    metadata_router,
+    monkeypatch,
+    path,
+    params,
+    catalog_model_info,
+):
+    monkeypatch.setattr(
+        proxy_server,
+        "get_litellm_model_info",
+        lambda model: catalog_model_info,
+    )
+
+    with auth_as():
+        response = client.get(path, params=params)
+
+    assert response.status_code == 200
+    model_info = response.json()["data"][0]["model_info"]
+    if "default_effort" in catalog_model_info:
+        assert "default_effort" in model_info
+        assert model_info["default_effort"] == catalog_model_info["default_effort"]
+    else:
+        assert "default_effort" not in model_info
+
+
+@pytest.mark.parametrize(
+    ("path", "params"),
+    [
+        ("/model/info", {"litellm_model_id": "default-effort-id"}),
+        ("/v1/model/info", {"litellm_model_id": "default-effort-id"}),
+        ("/v2/model/info", {"modelId": "default-effort-id"}),
+    ],
+)
+@pytest.mark.parametrize(
+    "catalog_model_info",
+    [
+        {"display_name": "OpenAI: GPT-5.6 Sol"},
+        {},
+        {"display_name": None},
+    ],
+    ids=["string", "missing", "explicit-null"],
+)
+def test_model_info_routes_preserve_display_name_key_presence(
+    client,
+    auth_as,
+    metadata_router,
+    monkeypatch,
+    path,
+    params,
+    catalog_model_info,
+):
+    monkeypatch.setattr(
+        proxy_server,
+        "get_litellm_model_info",
+        lambda model: catalog_model_info,
+    )
+
+    with auth_as():
+        response = client.get(path, params=params)
+
+    assert response.status_code == 200
+    model_info = response.json()["data"][0]["model_info"]
+    if "display_name" in catalog_model_info:
+        assert "display_name" in model_info
+        assert model_info["display_name"] == catalog_model_info["display_name"]
+    else:
+        assert "display_name" not in model_info
+
+
+@pytest.mark.parametrize(
+    ("path", "params"),
+    [
+        ("/model/info", {"litellm_model_id": "default-effort-id"}),
+        ("/v1/model/info", {"litellm_model_id": "default-effort-id"}),
+        ("/v2/model/info", {"modelId": "default-effort-id"}),
+    ],
+)
+@pytest.mark.parametrize(
+    "catalog_model_info",
+    [
+        {"supports_service_tier": True},
+        {"supports_service_tier": False},
+        {},
+        {"supports_service_tier": None},
+    ],
+    ids=["true", "false", "missing", "explicit-null"],
+)
+def test_model_info_routes_preserve_supports_service_tier_key_presence(
+    client,
+    auth_as,
+    metadata_router,
+    monkeypatch,
+    path,
+    params,
+    catalog_model_info,
+):
+    monkeypatch.setattr(
+        proxy_server,
+        "get_litellm_model_info",
+        lambda model: catalog_model_info,
+    )
+
+    with auth_as():
+        response = client.get(path, params=params)
+
+    assert response.status_code == 200
+    model_info = response.json()["data"][0]["model_info"]
+    if "supports_service_tier" in catalog_model_info:
+        assert "supports_service_tier" in model_info
+        assert (
+            model_info["supports_service_tier"]
+            is catalog_model_info["supports_service_tier"]
+        )
+    else:
+        assert "supports_service_tier" not in model_info
 
 
 @pytest.mark.parametrize("path", ["/v1/model/info", "/model/info"])

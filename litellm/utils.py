@@ -5695,6 +5695,8 @@ def _get_model_info_helper(
                 tiered_pricing=_model_info.get("tiered_pricing", None),
                 litellm_provider=_model_info.get("litellm_provider", custom_llm_provider),
                 mode=_model_info.get("mode"),
+                supported_modalities=_model_info.get("supported_modalities", None),
+                supported_output_modalities=_model_info.get("supported_output_modalities", None),
                 supports_system_messages=_model_info.get("supports_system_messages", None),
                 supports_response_schema=_model_info.get("supports_response_schema", None),
                 supports_vision=_model_info.get("supports_vision", None),
@@ -5733,6 +5735,12 @@ def _get_model_info_helper(
                 uses_embed_content=_model_info.get("uses_embed_content", None),
                 supports_image_size=_model_info.get("supports_image_size", None),
             )
+            if "supports_service_tier" in _model_info:
+                returned_model_info["supports_service_tier"] = _model_info["supports_service_tier"]
+            if "default_effort" in _model_info:
+                returned_model_info["default_effort"] = _model_info["default_effort"]
+            if "display_name" in _model_info:
+                returned_model_info["display_name"] = _model_info["display_name"]
             for cost_key, cost_value in _model_info.items():
                 if cost_key not in returned_model_info and _ABOVE_THRESHOLD_COST_KEY.search(cost_key) is not None:
                     returned_model_info[cost_key] = cost_value

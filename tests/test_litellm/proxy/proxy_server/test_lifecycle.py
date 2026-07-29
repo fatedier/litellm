@@ -677,6 +677,38 @@ def test_get_litellm_model_info_invalid_empty_dict_returns_empty():
     assert result == {}
 
 
+def test_get_litellm_model_info_surfaces_supported_modalities():
+    import litellm
+
+    try:
+        with patch.object(
+            litellm,
+            "model_cost",
+            {
+                "modality-metadata-test-model": {
+                    "input_cost_per_token": 0.0,
+                    "output_cost_per_token": 0.0,
+                    "litellm_provider": "openai",
+                    "mode": "chat",
+                    "supported_modalities": ["text", "image"],
+                    "supported_output_modalities": ["text"],
+                }
+            },
+        ):
+            litellm.get_model_info.cache_clear()
+            result = get_litellm_model_info(
+                model={
+                    "model_info": {},
+                    "litellm_params": {"model": "modality-metadata-test-model"},
+                }
+            )
+
+            assert result["supported_modalities"] == ["text", "image"]
+            assert result["supported_output_modalities"] == ["text"]
+    finally:
+        litellm.get_model_info.cache_clear()
+
+
 # ---------------------------------------------------------------------------
 # run_ollama_serve
 # ---------------------------------------------------------------------------

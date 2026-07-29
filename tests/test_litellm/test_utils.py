@@ -112,6 +112,107 @@ def local_model_cost_map(monkeypatch):
         litellm.get_model_info.cache_clear()
 
 
+@pytest.mark.parametrize(
+    "source_model_info",
+    [
+        {"default_effort": "vendor-defined"},
+        {},
+        {"default_effort": None},
+    ],
+    ids=["string", "missing", "explicit-null"],
+)
+def test_get_model_info_preserves_default_effort_key_presence(local_model_cost_map, monkeypatch, source_model_info):
+    monkeypatch.setitem(
+        litellm.model_cost,
+        "gpt-4",
+        {
+            "input_cost_per_token": 0.0,
+            "output_cost_per_token": 0.0,
+            "litellm_provider": "openai",
+            "mode": "chat",
+            **source_model_info,
+        },
+    )
+
+    model_info = litellm.get_model_info(model="gpt-4")
+
+    if "default_effort" in source_model_info:
+        assert "default_effort" in model_info
+        assert model_info["default_effort"] == source_model_info["default_effort"]
+    else:
+        assert "default_effort" not in model_info
+
+
+@pytest.mark.parametrize(
+    "source_model_info",
+    [
+        {"display_name": "OpenAI: GPT-5.6 Sol"},
+        {},
+        {"display_name": None},
+    ],
+    ids=["string", "missing", "explicit-null"],
+)
+def test_get_model_info_preserves_display_name_key_presence(
+    local_model_cost_map, monkeypatch, source_model_info
+):
+    monkeypatch.setitem(
+        litellm.model_cost,
+        "gpt-4",
+        {
+            "input_cost_per_token": 0.0,
+            "output_cost_per_token": 0.0,
+            "litellm_provider": "openai",
+            "mode": "chat",
+            **source_model_info,
+        },
+    )
+
+    model_info = litellm.get_model_info(model="gpt-4")
+
+    if "display_name" in source_model_info:
+        assert "display_name" in model_info
+        assert model_info["display_name"] == source_model_info["display_name"]
+    else:
+        assert "display_name" not in model_info
+
+
+@pytest.mark.parametrize(
+    "source_model_info",
+    [
+        {"supports_service_tier": True},
+        {"supports_service_tier": False},
+        {},
+        {"supports_service_tier": None},
+    ],
+    ids=["true", "false", "missing", "explicit-null"],
+)
+def test_get_model_info_preserves_supports_service_tier_key_presence(
+    local_model_cost_map, monkeypatch, source_model_info
+):
+    monkeypatch.setitem(
+        litellm.model_cost,
+        "gpt-4",
+        {
+            "input_cost_per_token": 0.0,
+            "output_cost_per_token": 0.0,
+            "litellm_provider": "openai",
+            "mode": "chat",
+            **source_model_info,
+        },
+    )
+
+    model_info = litellm.get_model_info(model="gpt-4")
+
+    if "supports_service_tier" in source_model_info:
+        assert "supports_service_tier" in model_info
+        assert (
+            model_info["supports_service_tier"]
+            is source_model_info["supports_service_tier"]
+        )
+    else:
+        assert "supports_service_tier" not in model_info
+
+
 def test_get_model_info_surfaces_supports_adaptive_thinking(local_model_cost_map):
     """supports_adaptive_thinking must flow through get_model_info like every other
     capability flag: both from an explicit cost-map entry and from a
@@ -126,6 +227,26 @@ def test_get_model_info_surfaces_supports_adaptive_thinking(local_model_cost_map
         model="claude-opus-4-9", custom_llm_provider="anthropic"
     )
     assert generalized["supports_adaptive_thinking"] is True
+
+
+def test_get_model_info_surfaces_supported_modalities(local_model_cost_map, monkeypatch):
+    monkeypatch.setitem(
+        litellm.model_cost,
+        "modality-metadata-test-model",
+        {
+            "input_cost_per_token": 0.0,
+            "output_cost_per_token": 0.0,
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "supported_modalities": ["text", "image"],
+            "supported_output_modalities": ["text"],
+        },
+    )
+
+    model_info = litellm.get_model_info(model="modality-metadata-test-model")
+
+    assert model_info["supported_modalities"] == ["text", "image"]
+    assert model_info["supported_output_modalities"] == ["text"]
 
 
 def test_check_provider_match_azure_ai_allows_openai_and_azure():
@@ -4254,8 +4375,6 @@ class TestValidateEnvironmentTencent:
 
         assert result["keys_in_environment"] is False
         assert "TENCENT_API_KEY" in result["missing_keys"]
-
-
 class TestVertexEmbeddingEncodingFormat:
     """vertex_ai/gemini embeddings must accept encoding_format="float" — it's
     the OpenAI SDK default and float lists are exactly what the vertex API

@@ -134,6 +134,8 @@ class ProviderField(TypedDict):
 
 
 class ProviderSpecificModelInfo(TypedDict, total=False):
+    supported_modalities: list[str] | None
+    supported_output_modalities: list[str] | None
     supports_system_messages: bool | None
     supports_response_schema: bool | None
     supports_vision: bool | None
@@ -162,6 +164,7 @@ class ProviderSpecificModelInfo(TypedDict, total=False):
     supports_max_reasoning_effort: bool | None
     supports_output_config: bool | None
     supports_image_size: bool | None
+    supports_service_tier: bool | None
     bedrock_output_config_effort_ceiling: Literal["low", "medium", "high", "max", "xhigh"] | None
     bedrock_converse_supports_strict_tools: bool | None
 
@@ -277,6 +280,8 @@ class ModelInfoBase(ProviderSpecificModelInfo, total=False):
     )  # "per_query" (Gemini 3.x) or "per_prompt" (Gemini 2.x)
     citation_cost_per_token: float | None  # Cost per citation token for Perplexity
     tiered_pricing: list[dict[str, Any]] | None  # Tiered pricing structure for models like Dashscope
+    default_effort: str | None
+    display_name: str | None
     litellm_provider: Required[str]
     mode: Required[
         Literal[
