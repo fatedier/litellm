@@ -865,6 +865,112 @@ def test_upsert_deployment(model_list):
     assert len(router.model_list) == len(model_list)
 
 
+def test_upsert_deployment_updates_model_name(model_list):
+    router = Router(model_list=model_list)
+    existing = router.get_deployment_by_model_group_name(
+        model_group_name="gpt-5-mini"
+    )
+    assert existing is not None
+    renamed = existing.model_copy(
+        update={"model_name": "renamed-gpt-5-mini"},
+        deep=True,
+    )
+
+    result = router.upsert_deployment(deployment=renamed)
+
+    assert result is renamed
+    assert len(router.model_list) == len(model_list)
+    assert router.get_deployment(model_id=existing.model_info.id).model_name == "renamed-gpt-5-mini"
+    assert router.get_deployment_by_model_group_name("gpt-5-mini") is None
+    assert router.get_deployment_by_model_group_name("renamed-gpt-5-mini") is not None
+    assert "gpt-5-mini" not in router.model_names
+    assert "renamed-gpt-5-mini" in router.model_names
+    assert router.deployment_names == [model["litellm_params"]["model"] for model in router.model_list]
+
+
+def test_upsert_deployment_preserves_shared_model_name():
+    router = Router(
+        model_list=[
+            {
+                "model_name": "shared-test",
+                "litellm_params": {"model": "openai/gpt-4o", "api_key": "fake-key"},
+                "model_info": {"id": "dep-1"},
+            },
+            {
+                "model_name": "shared-test",
+                "litellm_params": {"model": "openai/gpt-4.1", "api_key": "fake-key"},
+                "model_info": {"id": "dep-2"},
+            },
+        ]
+    )
+    existing = router.get_deployment(model_id="dep-1")
+    assert existing is not None
+    renamed = existing.model_copy(
+        update={"model_name": "shared"},
+        deep=True,
+    )
+
+    router.upsert_deployment(deployment=renamed)
+
+    assert router.model_names == {"shared-test", "shared"}
+    assert router.get_deployment_by_model_group_name("shared-test") is not None
+    assert router.get_deployment_by_model_group_name("shared") is not None
+    assert router.deployment_names == ["openai/gpt-4.1", "openai/gpt-4o"]
+
+
+@pytest.mark.parametrize(
+    ("new_model_name", "new_litellm_model", "new_team_public_model_name"),
+    [
+        ("public/*", "openai/gpt-4o", None),
+        ("renamed", "auto_router/custom", None),
+        ("renamed", "openai/gpt-4o", "team/*"),
+    ],
+)
+def test_upsert_deployment_rejects_auxiliary_routing_rename(
+    new_model_name,
+    new_litellm_model,
+    new_team_public_model_name,
+):
+    router = Router(
+        model_list=[
+            {
+                "model_name": "ordinary",
+                "litellm_params": {"model": "openai/gpt-4o", "api_key": "fake-key"},
+                "model_info": {"id": "dep-1"},
+            }
+        ]
+    )
+    existing = router.get_deployment(model_id="dep-1")
+    assert existing is not None
+    renamed = existing.model_copy(
+        update={
+            "model_name": new_model_name,
+            "litellm_params": existing.litellm_params.model_copy(
+                update={"model": new_litellm_model},
+                deep=True,
+            ),
+            "model_info": existing.model_info.model_copy(
+                update={"team_public_model_name": new_team_public_model_name},
+                deep=True,
+            ),
+        },
+        deep=True,
+    )
+
+    with pytest.raises(ValueError, match="Renaming wildcard and auto-router deployments is not supported"):
+        router.upsert_deployment(deployment=renamed)
+
+    assert router.get_deployment(model_id="dep-1") == existing
+    assert router.model_names == {"ordinary"}
+    assert router.deployment_names == ["openai/gpt-4o"]
+    assert router.pattern_router.patterns == {}
+    assert router.team_pattern_routers == {}
+    assert router.auto_routers == {}
+    assert router.complexity_routers == {}
+    assert router.adaptive_routers == {}
+    assert router.quality_routers == {}
+
+
 def test_delete_deployment(model_list):
     """Test if the 'delete_deployment' function is working correctly"""
     router = Router(model_list=model_list)

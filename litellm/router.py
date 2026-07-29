@@ -8757,15 +8757,24 @@ class Router:
 
             _deployment_on_router: Final[Deployment | None] = self.get_deployment(model_id=_deployment_model_id)
             if _deployment_on_router is not None:
+                if deployment.model_name != _deployment_on_router.model_name and (
+                    "*" in deployment.model_name
+                    or "*" in _deployment_on_router.model_name
+                    or "*" in (deployment.model_info.team_public_model_name or "")
+                    or "*" in (_deployment_on_router.model_info.team_public_model_name or "")
+                    or deployment.litellm_params.model.startswith("auto_router/")
+                    or _deployment_on_router.litellm_params.model.startswith("auto_router/")
+                ):
+                    raise ValueError("Renaming wildcard and auto-router deployments is not supported")
                 # deployment with this model_id exists on the router
                 if (
-                    deployment.litellm_params == _deployment_on_router.litellm_params
+                    deployment.model_name == _deployment_on_router.model_name
+                    and deployment.litellm_params == _deployment_on_router.litellm_params
                     and deployment.model_info == _deployment_on_router.model_info
                 ):
                     # No need to update
                     return None
 
-                # if there is a new litellm param -> then update the deployment
                 # remove the previous deployment
                 removal_idx: int | None = None
                 deployment_id: Final = deployment.model_info.id
@@ -8776,6 +8785,8 @@ class Router:
 
                     if removal_idx is not None:
                         self.model_list.pop(removal_idx)
+                        if _deployment_on_router.litellm_params.model in self.deployment_names:
+                            self.deployment_names.remove(_deployment_on_router.litellm_params.model)
                         self._invalidate_model_group_info_cache()
                         self._invalidate_access_groups_cache()
                         self._update_deployment_indices_after_removal(model_id=deployment_id, removal_idx=removal_idx)
@@ -8797,6 +8808,7 @@ class Router:
                 )
             ):
                 self._finalize_adaptive_router_if_configured()
+            self.model_names = set(self.model_name_to_deployment_indices)
             return deployment
         except Exception as e:
             if self.ignore_invalid_deployments:
