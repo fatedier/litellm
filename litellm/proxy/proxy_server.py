@@ -441,6 +441,9 @@ from litellm.proxy.management_endpoints.fallback_management_endpoints import (
 from litellm.proxy.management_endpoints.gateway_request_endpoints import (
     router as gateway_request_router,
 )
+from litellm.proxy.management_endpoints.internal_model_management_endpoints import (
+    router as internal_model_management_router,
+)
 from litellm.proxy.management_endpoints.internal_user_endpoints import (
     router as internal_user_router,
 )
@@ -881,9 +884,7 @@ async def _initialize_proxy_nova_aigateway_service() -> None:
 
 
 async def _shutdown_proxy_nova_aigateway_service() -> None:
-    proxy_nova_aigateway_service = getattr(
-        litellm, "proxy_nova_aigateway_service", None
-    )
+    proxy_nova_aigateway_service = getattr(litellm, "proxy_nova_aigateway_service", None)
     if proxy_nova_aigateway_service is None:
         return
 
@@ -5197,6 +5198,15 @@ class ProxyConfig:
                 await initialize_pass_through_endpoints(
                     pass_through_endpoints=general_settings["pass_through_endpoints"],
                     config_file_path=config_file_path,
+                )
+            if general_settings.get("websocket_pass_through_endpoints", None) is not None:
+                # WebSocket auth passthrough is config-file only. It is not
+                # merged with DB-backed general settings, so routes defined here
+                # remain stable for the lifetime of the process. This field is
+                # not DB-editable; pre-release/manual DB rows for it are not a
+                # supported configuration source.
+                await initialize_websocket_auth_passthrough_endpoints(
+                    websocket_pass_through_endpoints=general_settings["websocket_pass_through_endpoints"]
                 )
 
             ## ADMIN UI ACCESS ##
@@ -9551,11 +9561,7 @@ def _append_advertised_models_to_model_data(
 
     from litellm.proxy.utils import create_model_info_response
 
-    model_index_by_id = {
-        model["id"]: idx
-        for idx, model in enumerate(model_data)
-        if isinstance(model.get("id"), str)
-    }
+    model_index_by_id = {model["id"]: idx for idx, model in enumerate(model_data) if isinstance(model.get("id"), str)}
 
     for advertised_model in advertised_models:
         if not isinstance(advertised_model, dict):
@@ -9580,9 +9586,7 @@ def _append_advertised_models_to_model_data(
     return model_data
 
 
-@router.get(
-    "/v1/models", dependencies=[Depends(user_api_key_auth)], tags=["model management"]
-)
+@router.get("/v1/models", dependencies=[Depends(user_api_key_auth)], tags=["model management"])
 @router.get(
     "/models", dependencies=[Depends(user_api_key_auth)], tags=["model management"]
 )  # if project requires model list
@@ -17261,6 +17265,7 @@ app.include_router(pass_through_router)
 app.include_router(health_router)
 app.include_router(key_management_router)
 app.include_router(internal_user_router)
+app.include_router(internal_model_management_router)
 app.include_router(team_router)
 app.include_router(ui_sso_router)
 app.include_router(organization_router)

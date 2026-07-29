@@ -654,6 +654,8 @@ class LiteLLMRoutes(enum.Enum):
             "/model/update",
             "/model/delete",
             "/model/info",
+            "/internal/v1/model-deployments",
+            "/internal/v1/model-deployments/{model_id}",
             "/jwt/key/mapping/new",
             "/jwt/key/mapping/update",
             "/jwt/key/mapping/delete",
