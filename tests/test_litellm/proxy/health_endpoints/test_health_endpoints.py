@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+from collections.abc import Awaitable
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -465,6 +466,60 @@ async def test_test_model_connection_loads_config_from_router():
         # Verify result
         assert result["status"] == "success"
         assert "result" in result
+
+
+@pytest.mark.asyncio
+async def test_test_model_connection_inline_does_not_load_router_config():
+    mock_request = MagicMock()
+    mock_user_api_key_dict = MagicMock()
+    mock_user_api_key_dict.user_id = "test-user"
+    mock_user_api_key_dict.token = "test-token"
+
+    mock_prisma_client = MagicMock()
+    mock_router = MagicMock()
+    mock_can_user_make_model_call = AsyncMock()
+    mock_ahealth_check = AsyncMock(return_value={"status": "healthy"})
+
+    async def mock_run_with_timeout(task: Awaitable[dict[str, object]], _timeout: int) -> dict[str, object]:
+        return await task
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", mock_prisma_client),
+        patch("litellm.proxy.proxy_server.llm_router", mock_router),
+        patch("litellm.proxy.proxy_server.premium_user", False),
+        patch(
+            "litellm.proxy.management_endpoints.model_management_endpoints."
+            "ModelManagementAuthChecks.can_user_make_model_call",
+            mock_can_user_make_model_call,
+        ),
+        patch(
+            "litellm.proxy.health_endpoints._health_endpoints.litellm.ahealth_check",
+            mock_ahealth_check,
+        ),
+        patch(
+            "litellm.proxy.health_endpoints._health_endpoints.run_with_timeout",
+            mock_run_with_timeout,
+        ),
+    ):
+        result = await health_test_model_connection(
+            request=mock_request,
+            mode="chat",
+            config_source="inline",
+            litellm_params={
+                "model": "openai/gpt-4o",
+                "api_key": "inline-api-key",
+                "api_base": "https://inline.example/v1",
+            },
+            model_info={},
+            user_api_key_dict=mock_user_api_key_dict,
+        )
+
+    mock_router.get_deployment.assert_not_called()
+    mock_router.get_model_list.assert_not_called()
+    model_params = mock_ahealth_check.call_args.kwargs["model_params"]
+    assert model_params["api_key"] == "inline-api-key"
+    assert model_params["api_base"] == "https://inline.example/v1"
+    assert result["status"] == "success"
 
 
 @pytest.mark.asyncio

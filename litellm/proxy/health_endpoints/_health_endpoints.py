@@ -1800,6 +1800,7 @@ async def test_model_connection(
         None,
         description="The mode to test the model with. If not provided, auto-detected from model capabilities.",
     ),
+    config_source: Literal["auto", "inline"] = fastapi.Body("auto"),
     litellm_params: dict = fastapi.Body(
         None,
         description="Parameters for litellm.completion, litellm.embedding for the health check",
@@ -1887,7 +1888,7 @@ async def test_model_connection(
         # This gets the litellm_params from proxy config (with resolved env vars)
         config_litellm_params: dict = {}
         loaded_model_info: dict | None = None
-        if llm_router is not None:
+        if llm_router is not None and config_source != "inline":
             # Prefer disambiguation by deployment id (`model_info.id`) when
             # the caller supplies it. This is required when multiple
             # deployments share a `model_name` (e.g. wildcard `openai/*`
