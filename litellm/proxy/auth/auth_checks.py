@@ -14,6 +14,7 @@ import math
 import re
 import time
 from collections.abc import Iterator, Mapping, Sequence
+from functools import lru_cache
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
@@ -3895,6 +3896,8 @@ def can_project_access_model(
 
 MAX_MODEL_NAME_LENGTH_FOR_PATTERN_MATCH = 4096
 MAX_WILDCARDS_FOR_PATTERN_MATCH = 2
+MODEL_PATTERN_COMPILE_CACHE_SIZE = 8192
+MAX_CACHED_MODEL_PATTERN_LENGTH = 256
 
 
 def bounded_models_for_pattern_match(
@@ -5100,6 +5103,40 @@ async def _tag_max_budget_check(
             )
 
 
+def _compile_model_pattern(allowed_model_pattern: str) -> "re.Pattern[str]":
+    """Compile an allowlist entry as a glob: only ``*`` is special.
+
+    Every other character matches itself, so an entry naming one model cannot
+    grant a family of models whose names merely resemble it, an unbalanced
+    bracket in a model name cannot raise, and no entry can express the nested
+    quantifier that makes matching cost grow exponentially.
+    """
+    return re.compile("^" + ".*".join(re.escape(segment) for segment in allowed_model_pattern.split("*")) + "$")
+
+
+_compile_model_pattern_cached = lru_cache(maxsize=MODEL_PATTERN_COMPILE_CACHE_SIZE)(_compile_model_pattern)
+
+
+def _compiled_model_pattern(allowed_model_pattern: str) -> "re.Pattern[str]":
+    """Return the compiled form of an allowlist entry, retaining the usual ones.
+
+    An entry is checked once per candidate model and ``re`` caches only 512
+    pattern strings, so an allowlist larger than that recompiles on every call,
+    which costs 30 times more than the match it precedes.
+
+    Retention is bounded by entry length as well as count, because a cached
+    entry holds both the string and a compiled form an order of magnitude
+    larger, and nothing bounds how long a models entry may be: retaining every
+    one would let rotating long unique wildcards grow each worker by hundreds
+    of megabytes. The longest name in the shipped cost map is 76 characters, so
+    an entry past the bound is a pathological one, and compiling it per check
+    is what the ``re`` cache already did for any allowlist past its own size.
+    """
+    if len(allowed_model_pattern) > MAX_CACHED_MODEL_PATTERN_LENGTH:
+        return _compile_model_pattern(allowed_model_pattern)
+    return _compile_model_pattern_cached(allowed_model_pattern)
+
+
 def is_model_allowed_by_pattern(model: str, allowed_model_pattern: str) -> bool:
     """
     Check if a model matches an allowed pattern.
@@ -5113,8 +5150,7 @@ def is_model_allowed_by_pattern(model: str, allowed_model_pattern: str) -> bool:
         bool: True if model matches the pattern, False otherwise
     """
     if "*" in allowed_model_pattern:
-        pattern: Final = f"^{allowed_model_pattern.replace('*', '.*')}$"
-        return bool(re.match(pattern, model))
+        return bool(_compiled_model_pattern(allowed_model_pattern).match(model))
 
     return False
 
