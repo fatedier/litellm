@@ -384,6 +384,8 @@ async def new_organization(
         litellm_proxy_admin_name,
         llm_router,
         prisma_client,
+        proxy_logging_obj,
+        user_api_key_cache,
     )
 
     if prisma_client is None:
@@ -417,11 +419,15 @@ async def new_organization(
 
     if user_api_key_dict.user_id is not None:
         try:
-            user_object: Final = await _table(UserRepository(prisma_client)).find_unique(
-                where={"user_id": user_api_key_dict.user_id}
+            user_object_correct_type = await get_user_object(
+                user_id=user_api_key_dict.user_id,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                user_id_upsert=False,
+                parent_otel_span=user_api_key_dict.parent_otel_span,
+                proxy_logging_obj=proxy_logging_obj,
             )
-            if user_object is not None:
-                user_object_correct_type = LiteLLM_UserTable.model_validate(user_object.model_dump())
+            user_object = user_object_correct_type
         except Exception:
             pass
 

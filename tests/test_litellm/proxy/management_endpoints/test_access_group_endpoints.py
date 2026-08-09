@@ -109,12 +109,19 @@ def client_and_mocks(monkeypatch):
     mock_key_table.find_unique = AsyncMock(return_value=None)
     mock_key_table.update = AsyncMock(return_value=None)
 
+    mock_membership_table = MagicMock()
+    mock_membership_table.count = AsyncMock(return_value=0)
+    mock_membership_table.group_by = AsyncMock(return_value=[])
+    mock_membership_table.find_many = AsyncMock(return_value=[])
+    mock_membership_table.delete_many = AsyncMock(return_value=None)
+
     @asynccontextmanager
     async def mock_tx():
         tx = types.SimpleNamespace(
             litellm_accessgrouptable=mock_access_group_table,
             litellm_teamtable=mock_team_table,
             litellm_verificationtoken=mock_key_table,
+            litellm_useraccessgroupmembership=mock_membership_table,
         )
         yield tx
 
@@ -122,6 +129,7 @@ def client_and_mocks(monkeypatch):
         litellm_accessgrouptable=mock_access_group_table,
         litellm_teamtable=mock_team_table,
         litellm_verificationtoken=mock_key_table,
+        litellm_useraccessgroupmembership=mock_membership_table,
         tx=mock_tx,
     )
     mock_prisma.db = mock_db
@@ -1316,3 +1324,109 @@ def test_update_access_group_null_assigned_ids_treated_as_empty(client_and_mocks
     update_call_kwargs = mock_table.update.call_args.kwargs
     assert update_call_kwargs["data"]["assigned_team_ids"] == []
     assert update_call_kwargs["data"]["assigned_key_ids"] == []
+
+
+def test_delete_access_group_409_when_users_assigned(client_and_mocks):
+    """Deleting a group that still has user memberships must 409 and leave the group intact."""
+    client, mock_prisma, mock_table, *_ = client_and_mocks
+
+    existing = _make_access_group_record(access_group_id="ag-held")
+    mock_table.find_unique = AsyncMock(return_value=existing)
+    mock_prisma.db.litellm_useraccessgroupmembership.count = AsyncMock(return_value=2)
+
+    resp = client.delete("/v1/access_group/ag-held")
+    assert resp.status_code == 409
+    mock_table.delete.assert_not_awaited()
+
+
+def test_delete_access_group_maps_membership_fk_violation_to_409(client_and_mocks):
+    """A membership created between the count and the delete hits the DB RESTRICT
+    constraint; the P2003 error must surface as 409, not 500."""
+    client, mock_prisma, mock_table, *_ = client_and_mocks
+
+    existing = _make_access_group_record(access_group_id="ag-race")
+    mock_table.find_unique = AsyncMock(return_value=existing)
+    mock_table.delete = AsyncMock(
+        side_effect=Exception(
+            "Foreign key constraint failed on the field: "
+            "`LiteLLM_UserAccessGroupMembership_access_group_id_fkey` (P2003)"
+        )
+    )
+
+    resp = client.delete("/v1/access_group/ag-race")
+    assert resp.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# user_count
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("base_path", ACCESS_GROUP_PATHS)
+def test_list_access_groups_reports_user_count(client_and_mocks, base_path):
+    """A group's member count is what the listing exists to show, and a group
+    nobody is in produces no aggregate row, so it has to read as zero rather
+    than dropping out or raising."""
+    client, mock_prisma, mock_table, *_ = client_and_mocks
+
+    mock_table.find_many = AsyncMock(
+        return_value=[
+            _make_access_group_record(access_group_id="ag-1", access_group_name="g1"),
+            _make_access_group_record(access_group_id="ag-2", access_group_name="g2"),
+        ]
+    )
+    membership = mock_prisma.db.litellm_useraccessgroupmembership
+    membership.group_by = AsyncMock(
+        return_value=[{"access_group_id": "ag-1", "_count": {"user_id": 3}}]
+    )
+
+    resp = client.get(base_path)
+    assert resp.status_code == 200
+    assert {g["access_group_id"]: g["user_count"] for g in resp.json()} == {"ag-1": 3, "ag-2": 0}
+
+
+def test_get_access_group_reports_user_count(client_and_mocks):
+    """Reading one group counts that group alone rather than aggregating all."""
+    client, mock_prisma, mock_table, *_ = client_and_mocks
+
+    mock_table.find_unique = AsyncMock(return_value=_make_access_group_record(access_group_id="ag-123"))
+    membership = mock_prisma.db.litellm_useraccessgroupmembership
+    membership.count = AsyncMock(return_value=7)
+
+    resp = client.get("/v1/access_group/ag-123")
+    assert resp.status_code == 200
+    assert resp.json()["user_count"] == 7
+    membership.count.assert_awaited_once_with(where={"access_group_id": "ag-123"})
+
+
+def test_create_access_group_reports_zero_user_count(client_and_mocks):
+    """A group cannot be created with members, so its count is zero without a query."""
+    client, mock_prisma, *_ = client_and_mocks
+
+    membership = mock_prisma.db.litellm_useraccessgroupmembership
+    membership.count = AsyncMock(return_value=99)
+
+    resp = client.post("/v1/access_group", json={"access_group_name": "fresh-group"})
+    assert resp.status_code == 201
+    assert resp.json()["user_count"] == 0
+
+
+def test_user_count_counts_only_user_memberships(client_and_mocks):
+    """Teams and keys can also be assigned to a group. user_count means users
+    alone; the other two are already visible as list lengths on the same
+    response and must not be folded into it."""
+    client, mock_prisma, mock_table, *_ = client_and_mocks
+
+    mock_table.find_unique = AsyncMock(
+        return_value=_make_access_group_record(
+            access_group_id="ag-123",
+            assigned_team_ids=["team-a", "team-b"],
+            assigned_key_ids=["key-a", "key-b", "key-c"],
+        )
+    )
+    mock_prisma.db.litellm_useraccessgroupmembership.count = AsyncMock(return_value=0)
+
+    body = client.get("/v1/access_group/ag-123").json()
+    assert body["user_count"] == 0
+    assert len(body["assigned_team_ids"]) == 2
+    assert len(body["assigned_key_ids"]) == 3

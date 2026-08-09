@@ -49,6 +49,7 @@ from litellm.repositories.table_repositories import (
     MemoryRepository,
     ModelTableRepository,
     OrganizationMembershipRepository,
+    UserAccessGroupMembershipRepository,
     PolicyAttachmentRepository,
     PolicyRepository,
     PrismaTableRepository,
@@ -87,6 +88,7 @@ from litellm.repositories.verification_token_repository import (
 
 __all__ = [
     "AccessGroupRepository",
+    "UserAccessGroupMembershipRepository",
     "AdaptiveRouterSessionRepository",
     "AdaptiveRouterStateRepository",
     "AgentsRepository",

@@ -146,6 +146,10 @@ class AccessGroupRepository(PrismaTableRepository):
     table_name = "litellm_accessgrouptable"
 
 
+class UserAccessGroupMembershipRepository(PrismaTableRepository):
+    table_name = "litellm_useraccessgroupmembership"
+
+
 class SSOConfigRepository(PrismaTableRepository):
     table_name = "litellm_ssoconfig"
 

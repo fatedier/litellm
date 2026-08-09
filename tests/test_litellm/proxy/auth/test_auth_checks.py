@@ -3348,7 +3348,10 @@ async def test_get_fuzzy_user_object_case_insensitive_email():
     call_args = mock_prisma.db.litellm_usertable.find_first.call_args
     assert call_args.kwargs["where"]["user_email"]["equals"] == "test@example.com"
     assert call_args.kwargs["where"]["user_email"]["mode"] == "insensitive"
-    assert call_args.kwargs["include"] == {"organization_memberships": True}
+    assert call_args.kwargs["include"] == {
+        "organization_memberships": True,
+        "access_group_memberships": True,
+    }
 
 
 @pytest.mark.asyncio

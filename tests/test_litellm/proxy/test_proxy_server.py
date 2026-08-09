@@ -11107,3 +11107,50 @@ async def test_update_cache_preserves_remaining_user_object_ttl():
         assert expiry_after <= expiry_before + 0.5
     finally:
         setattr(litellm.proxy.proxy_server, "user_api_key_cache", original_cache)
+
+
+@pytest.mark.asyncio
+async def test_get_user_object_for_model_filtering_raises_when_load_fails():
+    """A transient user-object load failure must not collapse into the same
+    ``None`` that means "no filtering applies": get_available_models_for_user
+    treats None as unrestricted, so a restricted personal key would receive the
+    full proxy model list during a database blip."""
+    from fastapi import HTTPException
+
+    from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.proxy_server import _get_user_object_for_model_filtering
+
+    key = UserAPIKeyAuth(
+        token="t",
+        user_id="restricted-user",
+        user_role=LitellmUserRoles.INTERNAL_USER,
+    )
+
+    with patch("litellm.proxy.proxy_server.prisma_client", MagicMock()):
+        with patch("litellm.proxy.proxy_server.user_api_key_cache", MagicMock()):
+            with patch(
+                "litellm.proxy.auth.auth_checks.get_user_object",
+                new=AsyncMock(side_effect=ValueError("db down")),
+            ):
+                with pytest.raises(HTTPException) as exc_info:
+                    await _get_user_object_for_model_filtering(key)
+
+    assert exc_info.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_get_user_object_for_model_filtering_returns_none_for_admin():
+    """Admin keys legitimately need no user-level filtering; that ``None`` must
+    survive the fail-closed change."""
+    from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.proxy_server import _get_user_object_for_model_filtering
+
+    key = UserAPIKeyAuth(
+        token="t",
+        user_id="admin-user",
+        user_role=LitellmUserRoles.PROXY_ADMIN,
+    )
+
+    with patch("litellm.proxy.proxy_server.prisma_client", MagicMock()):
+        with patch("litellm.proxy.proxy_server.user_api_key_cache", MagicMock()):
+            assert await _get_user_object_for_model_filtering(key) is None

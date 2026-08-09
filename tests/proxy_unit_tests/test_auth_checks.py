@@ -861,7 +861,7 @@ async def test_get_fuzzy_user_object():
     )
     assert result == test_user
     mock_prisma.db.litellm_usertable.find_unique.assert_called_with(
-        where={"sso_user_id": "sso_123"}, include={"organization_memberships": True}
+        where={"sso_user_id": "sso_123"}, include={"organization_memberships": True, "access_group_memberships": True}
     )
 
     # Test 2: SSO ID not found, find by email
@@ -877,7 +877,7 @@ async def test_get_fuzzy_user_object():
     assert result == test_user
     mock_prisma.db.litellm_usertable.find_first.assert_called_with(
         where={"user_email": {"equals": "test@example.com", "mode": "insensitive"}},
-        include={"organization_memberships": True},
+        include={"organization_memberships": True, "access_group_memberships": True},
     )
 
     # Test 3: Verify background SSO update task when user found by email
@@ -905,7 +905,7 @@ async def test_get_fuzzy_user_object():
     assert result == test_user
     mock_prisma.db.litellm_usertable.find_first.assert_called_with(
         where={"user_email": {"equals": "test@example.com", "mode": "insensitive"}},
-        include={"organization_memberships": True},
+        include={"organization_memberships": True, "access_group_memberships": True},
     )
 
     # Test 6: Only SSO ID provided (no email)
@@ -915,7 +915,7 @@ async def test_get_fuzzy_user_object():
     )
     assert result == test_user
     mock_prisma.db.litellm_usertable.find_unique.assert_called_with(
-        where={"sso_user_id": "sso_123"}, include={"organization_memberships": True}
+        where={"sso_user_id": "sso_123"}, include={"organization_memberships": True, "access_group_memberships": True}
     )
 
 

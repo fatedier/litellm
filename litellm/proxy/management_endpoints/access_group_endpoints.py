@@ -1,7 +1,8 @@
 from collections.abc import Mapping, Sequence
-from typing import Final, Protocol
-
+from types import MappingProxyType
+from typing import Final, List, Optional, Protocol, Set, runtime_checkable
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field, TypeAdapter
 
 from litellm._logging import verbose_proxy_logger
 from litellm.proxy._types import (
@@ -119,8 +120,90 @@ def _require_admin_view(user_api_key_dict: UserAPIKeyAuth) -> None:
         )
 
 
-def _record_to_response(record: _AccessGroupRecord) -> AccessGroupResponse:
-    return AccessGroupResponse.model_validate(record.dict())
+@runtime_checkable
+class _MembershipCountTable(Protocol):
+    """The two reads the member count needs, as a typed boundary.
+
+    The repository exposes its table as ``Any``, so calling through it directly
+    would spread that through every count. Narrowing once here keeps the rest
+    typed without annotating the Prisma client itself.
+    """
+
+    async def count(self, where: Mapping[str, object]) -> int: ...
+
+    async def group_by(
+        self,
+        by: Sequence[str],
+        where: Mapping[str, object] | None = ...,
+        count: Mapping[str, bool] | None = ...,
+    ) -> object: ...
+
+
+class _MemberCount(BaseModel):
+    user_id: int
+
+
+class _GroupMemberCountRow(BaseModel):
+    access_group_id: str
+    member_count: _MemberCount = Field(alias="_count")
+
+
+_GROUP_MEMBER_COUNT_ROWS = TypeAdapter(tuple[_GroupMemberCountRow, ...])
+
+
+def _require_membership_table(prisma_client: object) -> _MembershipCountTable:
+    table = getattr(getattr(prisma_client, "db", None), "litellm_useraccessgroupmembership", None)
+    if not isinstance(table, _MembershipCountTable):
+        raise TypeError("database does not expose the access group membership table")
+    return table
+
+
+async def _count_group_members(prisma_client: object, access_group_id: str) -> int:
+    """Count the users assigned to one group.
+
+    Counts the join table alone. Teams and keys can also be assigned to a group,
+    but those are already on the response as ``assigned_team_ids`` and
+    ``assigned_key_ids``; folding them in would make the number mean nothing in
+    particular.
+    """
+    return await _require_membership_table(prisma_client).count(where={"access_group_id": access_group_id})
+
+
+async def _count_members_by_group(
+    prisma_client: object, access_group_ids: Optional[Sequence[str]] = None
+) -> Mapping[str, int]:
+    """Count members for many groups in one aggregate.
+
+    Asking per group would issue one query per row of the listing. A group
+    nobody belongs to produces no row here, so callers must default it to zero
+    rather than indexing the result.
+    """
+    rows = await _require_membership_table(prisma_client).group_by(
+        by=["access_group_id"],
+        where={"access_group_id": {"in": list(access_group_ids)}} if access_group_ids is not None else None,
+        count={"user_id": True},
+    )
+    return MappingProxyType(
+        {row.access_group_id: row.member_count.user_id for row in _GROUP_MEMBER_COUNT_ROWS.validate_python(rows)}
+    )
+
+
+def _record_to_response(record, *, user_count: int) -> AccessGroupResponse:
+    return AccessGroupResponse(
+        access_group_id=record.access_group_id,
+        access_group_name=record.access_group_name,
+        description=record.description,
+        access_model_names=record.access_model_names,
+        access_mcp_server_ids=record.access_mcp_server_ids,
+        access_agent_ids=record.access_agent_ids,
+        assigned_team_ids=record.assigned_team_ids,
+        assigned_key_ids=record.assigned_key_ids,
+        created_at=record.created_at,
+        created_by=record.created_by,
+        updated_at=record.updated_at,
+        updated_by=record.updated_by,
+        user_count=user_count,
+    )
 
 
 def _record_to_access_group_table(record: _AccessGroupRecord) -> LiteLLM_AccessGroupTable:
@@ -377,7 +460,7 @@ async def create_access_group(
         proxy_logging_obj,
     )
 
-    return _record_to_response(record)
+    return _record_to_response(record, user_count=0)
 
 
 @router.get(
@@ -392,7 +475,8 @@ async def list_access_groups(
 
     table: Final[_AccessGroupTable] = AccessGroupRepository(prisma_client).table
     records: Final = await table.find_many(order={"created_at": "desc"})
-    return [_record_to_response(r) for r in records]
+    member_counts = await _count_members_by_group(prisma_client)
+    return [_record_to_response(r, user_count=member_counts.get(r.access_group_id, 0)) for r in records]
 
 
 @router.get(
@@ -413,7 +497,7 @@ async def get_access_group(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Access group '{access_group_id}' not found",
         )
-    return _record_to_response(record)
+    return _record_to_response(record, user_count=await _count_group_members(prisma_client, access_group_id))
 
 
 @router.put(
@@ -508,7 +592,7 @@ async def update_access_group(
     await _patch_key_caches_add_access_group(keys_to_add, access_group_id, user_api_key_cache, proxy_logging_obj)
     await _patch_key_caches_remove_access_group(keys_to_remove, access_group_id, user_api_key_cache, proxy_logging_obj)
 
-    return _record_to_response(record)
+    return _record_to_response(record, user_count=await _count_group_members(prisma_client, access_group_id))
 
 
 @router.delete(
@@ -533,6 +617,18 @@ async def delete_access_group(
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=f"Access group '{access_group_id}' not found",
+                )
+
+            assigned_user_count = await tx.litellm_useraccessgroupmembership.count(
+                where={"access_group_id": access_group_id}
+            )
+            if assigned_user_count > 0:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"Access group '{access_group_id}' is still assigned to {assigned_user_count} user(s). "
+                        "Clear those users' access_group_ids before deleting it."
+                    ),
                 )
 
             # Union of: teams that have this access_group_id in their own access_group_ids
@@ -604,6 +700,14 @@ async def delete_access_group(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Access group '{access_group_id}' not found",
+            )
+        if "P2003" in str(e) or "foreign key constraint" in str(e).lower():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Access group '{access_group_id}' is still assigned to one or more users. "
+                    "Clear those users' access_group_ids before deleting it."
+                ),
             )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

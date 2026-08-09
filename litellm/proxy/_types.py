@@ -1660,6 +1660,7 @@ class NewUserRequest(GenerateRequestBase):
     send_invite_email: bool | None = None
     sso_user_id: str | None = None
     organizations: list[str] | None = None
+    access_group_ids: list[str] | None = None
 
 
 class NewUserResponse(GenerateKeyResponse):
@@ -1696,6 +1697,7 @@ class UpdateUserRequestNoUserIDorEmail(GenerateRequestBase):  # shared with Bulk
         | None
     ) = None
     max_budget: float | None = None
+    access_group_ids: list[str] | None = None
 
 
 class UpdateUserRequest(UpdateUserRequestNoUserIDorEmail):
@@ -2987,6 +2989,7 @@ class UserInfoV2Response(LiteLLMPydanticObjectBase):
     sso_user_id: str | None = None
     teams: list[str] = []  # Just team IDs, not full team objects
     object_permission: LiteLLM_ObjectPermissionTable | None = None
+    access_group_ids: list[str] = []
 
 
 from litellm.models.config import LiteLLM_Config as LiteLLM_Config  # noqa: E402

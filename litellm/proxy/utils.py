@@ -176,6 +176,7 @@ if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
     from litellm.models.team import LiteLLM_TeamTableCachedObj
     from litellm.proxy.db.autorouter_session_rollup import AutoRouterTurnTransaction
+    from litellm.models.user import LiteLLM_UserTable
     from litellm.proxy.db.spend_log_tool_index import ToolUsageTransaction
 
     Span = _Span | object
@@ -4244,9 +4245,11 @@ class PrismaClient:
                 batcher = self.db.batch_()
                 for idx, user in enumerate(data_list):
                     try:
-                        data_json = self.jsonify_object(data=user.model_dump(exclude_none=True))
+                        data_json = self.jsonify_object(
+                            data=user.model_dump(exclude_none=True, exclude={"access_group_ids"})
+                        )
                     except Exception:
-                        data_json = self.jsonify_object(data=user.dict())
+                        data_json = self.jsonify_object(data=user.dict(exclude={"access_group_ids"}))
                     batcher.litellm_usertable.upsert(
                         where={"user_id": user.user_id},
                         data={
@@ -6877,6 +6880,7 @@ async def get_available_models_for_user(
     only_model_access_groups: bool = False,
     return_wildcard_routes: bool = False,
     user_api_key_cache: Optional["UserApiKeyCache"] = None,
+    user_object: "LiteLLM_UserTable | None" = None,
 ) -> list[str]:
     """
     Get the list of models available to a user based on their API key and team permissions.
@@ -6980,7 +6984,102 @@ async def get_available_models_for_user(
         team_id=effective_team_id,
     )
 
+    if user_object is not None and effective_team_id is None:
+        return await filter_models_by_user_access(
+            models=all_models,
+            user_object=user_object,
+            llm_router=llm_router,
+        )
+
     return all_models
+
+
+def _user_allowlist_needs_authorization_expansion(
+    allowed_models: list[str],
+    llm_router: Optional["Router"],
+) -> bool:
+    """Whether authorization would grant model names this allowlist does not contain.
+
+    Authorization expands a config-declared access group named in the allowlist
+    into its members, and resolves a candidate through the global
+    litellm.model_alias_map or the router's alias map before matching. Any of
+    those let it allow a name that is absent from the allowlist itself, so a
+    caller that probes the allowlist directly must not take that shortcut here.
+    A new expansion source in ``_can_object_call_model`` has to be added here too.
+    """
+    router_access_groups = llm_router.get_model_access_groups() if llm_router is not None else {}
+    router_aliases = (getattr(llm_router, "model_group_alias", None) or {}) if llm_router is not None else {}
+    return (
+        any(name in router_access_groups for name in allowed_models)
+        or bool(router_aliases)
+        or bool(litellm.model_alias_map)
+    )
+
+
+async def filter_models_by_user_access(
+    models: list[str],
+    user_object: Optional["LiteLLM_UserTable"],
+    llm_router: Optional["Router"],
+) -> list[str]:
+    """Narrow a model listing to what a personal key's user may actually call.
+
+    Answers exactly what ``can_user_call_model`` answers per model, and calls it
+    directly whenever the allowlist cannot be probed as a plain set of names.
+    Where it can, the allowlist is resolved once and matched as a set, because
+    asking per model re-resolves the user's access groups and rescans the whole
+    allowlist every time, which grows with catalogue size times allowlist size.
+    """
+    if user_object is None:
+        return models
+
+    from litellm.proxy._types import ProxyException
+    from litellm.proxy.auth.auth_checks import (
+        can_user_call_model,
+        resolve_user_effective_models,
+    )
+
+    async def _user_can_call(model: str) -> bool:
+        try:
+            await can_user_call_model(model=model, llm_router=llm_router, user_object=user_object)
+            return True
+        except ProxyException:
+            return False
+
+    effective_models = await resolve_user_effective_models(user_object=user_object)
+    if effective_models is None:
+        return models
+
+    allowed_models = [*effective_models.direct, *effective_models.group]
+    exact_names = frozenset(name for name in allowed_models if "*" not in name)
+    direct_patterns = [name for name in effective_models.direct if "*" in name]
+    group_patterns = [name for name in effective_models.group if "*" in name]
+    allowlist_is_probeable = allowed_models and not _user_allowlist_needs_authorization_expansion(
+        allowed_models=allowed_models, llm_router=llm_router
+    )
+
+    if not allowlist_is_probeable:
+        return [model for model in models if await _user_can_call(model)]
+
+    from litellm.proxy.auth.auth_checks import (
+        _model_matches_any_wildcard_pattern_in_list,
+        bounded_models_for_pattern_match,
+    )
+
+    def _model_is_allowed(model: str) -> bool:
+        if model in exact_names:
+            return True
+        if direct_patterns and _model_matches_any_wildcard_pattern_in_list(
+            model=model, allowed_model_list=direct_patterns
+        ):
+            return True
+        if not group_patterns:
+            return False
+        usable = bounded_models_for_pattern_match(model=model, models=group_patterns)
+        if not usable:
+            return False
+        return _model_matches_any_wildcard_pattern_in_list(model=model, allowed_model_list=usable)
+
+    return [model for model in models if _model_is_allowed(model)]
 
 
 def create_model_info_response(

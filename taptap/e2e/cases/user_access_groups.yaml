@@ -152,6 +152,17 @@ scenarios:
           json_equals:
             users[0].access_group_ids[0]: ${access_group_id}
 
+      - id: access_group_list_reports_member_count
+        request:
+          method: GET
+          path: /v1/access_group/${access_group_id}
+          headers:
+            Authorization: Bearer ${TAPTAP_E2E_MASTER_KEY}
+        expect:
+          status: 200
+          json_equals:
+            user_count: 1
+
       - id: user_info_returns_access_group_ids
         request:
           method: GET

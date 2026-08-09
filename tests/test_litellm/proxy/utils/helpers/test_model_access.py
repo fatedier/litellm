@@ -521,3 +521,316 @@ async def test_get_available_models_for_user_resolves_key_access_group_models(
         user_api_key_cache=MagicMock(),
     )
     assert result == ["model-b"]
+async def test_filter_models_by_user_access_direct_models():
+    from unittest.mock import AsyncMock, patch
+
+    from litellm.proxy._types import LiteLLM_UserTable
+    from litellm.proxy.utils import filter_models_by_user_access
+
+    user_object = LiteLLM_UserTable(user_id="u1", models=["m1"])
+
+    result = await filter_models_by_user_access(
+        models=["m1", "m2"],
+        user_object=user_object,
+        llm_router=None,
+    )
+    assert result == ["m1"]
+
+
+@pytest.mark.asyncio
+async def test_filter_models_by_user_access_includes_access_group_models():
+    from unittest.mock import AsyncMock, patch
+
+    from litellm.proxy._types import LiteLLM_UserTable
+    from litellm.proxy.utils import filter_models_by_user_access
+
+    user_object = LiteLLM_UserTable(user_id="u1", models=["m1"], access_group_ids=["group-1"])
+
+    with patch(
+        "litellm.proxy.auth.auth_checks._get_models_from_access_groups",
+        AsyncMock(return_value=["m2"]),
+    ):
+        result = await filter_models_by_user_access(
+            models=["m1", "m2", "m3"],
+            user_object=user_object,
+            llm_router=None,
+        )
+    assert result == ["m1", "m2"]
+
+
+@pytest.mark.asyncio
+async def test_filter_models_by_user_access_unrestricted_user_keeps_all():
+    from litellm.proxy._types import LiteLLM_UserTable
+    from litellm.proxy.utils import filter_models_by_user_access
+
+    result_none = await filter_models_by_user_access(
+        models=["m1", "m2"],
+        user_object=None,
+        llm_router=None,
+    )
+    assert result_none == ["m1", "m2"]
+
+    unrestricted = LiteLLM_UserTable(user_id="u1", models=[])
+    result_unrestricted = await filter_models_by_user_access(
+        models=["m1", "m2"],
+        user_object=unrestricted,
+        llm_router=None,
+    )
+    assert result_unrestricted == ["m1", "m2"]
+
+
+@pytest.mark.asyncio
+async def test_get_available_models_for_user_applies_user_object_filter():
+    from litellm.proxy._types import LiteLLM_UserTable
+
+    user_object = LiteLLM_UserTable(user_id="u1", models=["m1"])
+    key = UserAPIKeyAuth(models=["m1", "m2"], team_models=[], team_id=None)
+
+    all_models = await get_available_models_for_user(
+        user_api_key_dict=key,
+        llm_router=None,
+        general_settings={},
+        user_model=None,
+        user_object=user_object,
+    )
+    assert all_models == ["m1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user_models, group_models",
+    [
+        (["no-default-models"], ["m1", "m3"]),
+        (["m1"], ["m2"]),
+        (["no-default-models"], ["*"]),
+        (["no-default-models"], ["all-proxy-models"]),
+        (["no-default-models"], ["m-prefix-*"]),
+        (["m1"], ["m-prefix-*", "m3"]),
+        ([], ["m1"]),
+        (["no-default-models"], []),
+    ],
+)
+async def test_filter_models_by_user_access_agrees_with_can_user_call_model(user_models, group_models):
+    """The listing filter must decide exactly what request-time authorization
+    decides. It is allowed to be faster, but a model it hides has to be one
+    can_user_call_model would refuse, and vice versa, or users see models they
+    cannot call (or lose models they can)."""
+    from unittest.mock import AsyncMock, patch
+
+    from litellm.proxy._types import LiteLLM_UserTable, ProxyException
+    from litellm.proxy.auth.auth_checks import can_user_call_model
+    from litellm.proxy.utils import filter_models_by_user_access
+
+    candidates = ["m1", "m2", "m3", "m-prefix-a", "m-prefix-b", "unrelated"]
+    user_object = LiteLLM_UserTable(user_id="u", models=list(user_models), access_group_ids=["g1"])
+
+    with patch(
+        "litellm.proxy.auth.auth_checks._get_models_from_access_groups",
+        AsyncMock(return_value=list(group_models)),
+    ):
+        filtered = await filter_models_by_user_access(
+            models=list(candidates), user_object=user_object, llm_router=None
+        )
+
+        authoritative = []
+        for model in candidates:
+            try:
+                await can_user_call_model(model=model, llm_router=None, user_object=user_object)
+                authoritative.append(model)
+            except ProxyException:
+                pass
+
+    assert filtered == authoritative, f"user_models={user_models} group_models={group_models}"
+
+
+def _router_with_access_group(group_name: str, group_models: list, alias_map: dict | None = None):
+    """Router exposing a config-declared model access group and optional aliases."""
+    from collections import defaultdict
+
+    router = MagicMock()
+
+    def _groups(model_name=None, team_id=None):
+        groups = defaultdict(list)
+        groups[group_name] = list(group_models)
+        if model_name is not None and model_name not in group_models:
+            return defaultdict(list)
+        return groups
+
+    router.get_model_access_groups.side_effect = _groups
+    router.model_group_alias = alias_map or {}
+    router._get_model_from_alias.side_effect = lambda m: (alias_map or {}).get(m)
+    return router
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user_models, group_models, alias_map",
+    [
+        pytest.param(["no-default-models"], ["beta-models"], None, id="group-granted-config-access-group"),
+        pytest.param(["no-default-models"], ["a*a*a*b"], None, id="pattern-past-wildcard-bound"),
+        pytest.param(["beta-models"], [], None, id="directly-granted-config-access-group"),
+        pytest.param(["no-default-models"], ["gpt-4"], {"gpt-4-alias": "gpt-4"}, id="router-alias-of-granted-model"),
+        pytest.param(["no-default-models"], ["beta-models", "solo"], None, id="config-access-group-plus-plain-name"),
+    ],
+)
+async def test_filter_models_by_user_access_agrees_with_router_expansions(user_models, group_models, alias_map):
+    """The listing filter must also honor what the router expands: a config
+    access group named in the allowlist grants every model inside it, and a
+    visible alias resolves to its underlying model. Exact-name and wildcard
+    matching alone silently drops both."""
+    from unittest.mock import AsyncMock, patch
+
+    from litellm.proxy._types import LiteLLM_UserTable, ProxyException
+    from litellm.proxy.auth.auth_checks import can_user_call_model
+    from litellm.proxy.utils import filter_models_by_user_access
+
+    router = _router_with_access_group("beta-models", ["gpt-4", "claude-3"], alias_map)
+    candidates = ["gpt-4", "claude-3", "solo", "gpt-4-alias", "unrelated"]
+    user_object = LiteLLM_UserTable(user_id="u", models=list(user_models), access_group_ids=["g1"])
+
+    with patch(
+        "litellm.proxy.auth.auth_checks._get_models_from_access_groups",
+        AsyncMock(return_value=list(group_models)),
+    ):
+        filtered = await filter_models_by_user_access(
+            models=list(candidates), user_object=user_object, llm_router=router
+        )
+        authoritative = []
+        for model in candidates:
+            try:
+                await can_user_call_model(model=model, llm_router=router, user_object=user_object)
+                authoritative.append(model)
+            except ProxyException:
+                pass
+
+    assert filtered == authoritative, f"user_models={user_models} group_models={group_models} alias={alias_map}"
+
+
+@pytest.mark.asyncio
+async def test_filter_models_by_user_access_agrees_on_global_alias_map():
+    """litellm.model_alias_map is a second, router-independent alias source that
+    can_user_call_model resolves before matching, so a listed alias whose target
+    is allowed must stay listed even with no router configured."""
+    from unittest.mock import AsyncMock, patch
+
+    import litellm
+    from litellm.proxy._types import LiteLLM_UserTable, ProxyException
+    from litellm.proxy.auth.auth_checks import can_user_call_model
+    from litellm.proxy.utils import filter_models_by_user_access
+
+    original_alias_map = litellm.model_alias_map
+    litellm.model_alias_map = {"gpt-4-alias": "gpt-4"}
+    try:
+        candidates = ["gpt-4", "gpt-4-alias", "unrelated"]
+        user_object = LiteLLM_UserTable(
+            user_id="u", models=["no-default-models"], access_group_ids=["g1"]
+        )
+
+        with patch(
+            "litellm.proxy.auth.auth_checks._get_models_from_access_groups",
+            AsyncMock(return_value=["gpt-4"]),
+        ):
+            filtered = await filter_models_by_user_access(
+                models=list(candidates), user_object=user_object, llm_router=None
+            )
+            authoritative = []
+            for model in candidates:
+                try:
+                    await can_user_call_model(model=model, llm_router=None, user_object=user_object)
+                    authoritative.append(model)
+                except ProxyException:
+                    pass
+
+        assert filtered == authoritative
+    finally:
+        litellm.model_alias_map = original_alias_map
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "group_models, expected",
+    [
+        pytest.param(["a*"], ["a-normal-model"], id="group-pattern"),
+        pytest.param(["*"], ["a-normal-model", "a" * 5000], id="group-grants-everything"),
+        pytest.param(
+            ["all-proxy-models"], ["a-normal-model", "a" * 5000], id="group-grants-all-proxy-models"
+        ),
+    ],
+)
+async def test_filter_models_by_user_access_agrees_on_names_past_the_length_bound(group_models, expected):
+    """Authorization refuses to run a wildcard match against a name past the
+    length bound, so a catalogue entry that long has to be dropped here too or
+    the listing advertises a model every request for it will refuse. A group
+    that grants everything has no pattern to run, so the bound must not reach
+    it and strip a grant neither path would have spent anything on."""
+    from unittest.mock import AsyncMock, patch
+
+    from litellm.proxy._types import LiteLLM_UserTable, ProxyException
+    from litellm.proxy.auth.auth_checks import can_user_call_model
+    from litellm.proxy.utils import filter_models_by_user_access
+
+    candidates = ["a-normal-model", "a" * 5000]
+    user_object = LiteLLM_UserTable(
+        user_id="u", models=["no-default-models"], access_group_ids=["g1"]
+    )
+
+    with patch(
+        "litellm.proxy.auth.auth_checks._get_models_from_access_groups",
+        AsyncMock(return_value=list(group_models)),
+    ):
+        filtered = await filter_models_by_user_access(
+            models=list(candidates), user_object=user_object, llm_router=None
+        )
+        authoritative = []
+        for model in candidates:
+            try:
+                await can_user_call_model(model=model, llm_router=None, user_object=user_object)
+                authoritative.append(model)
+            except ProxyException:
+                pass
+
+    assert authoritative == expected
+    assert filtered == authoritative
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user_models, group_models, candidates",
+    [
+        pytest.param(["a*a*a*b"], [], ["aaab", "other"], id="direct-pattern-past-bound-no-group"),
+        pytest.param(["a*a*a*b"], ["group-model"], ["aaab", "group-model"], id="direct-pattern-past-bound-with-group"),
+        pytest.param(["a*a*a*b"], ["c*c*c*d"], ["aaab", "cccd"], id="both-sources-past-bound"),
+    ],
+)
+async def test_filter_models_by_user_access_leaves_direct_grants_unbounded(
+    user_models, group_models, candidates
+):
+    """The bound exists for the grants this feature adds. A user's own models
+    are matched unbounded by the direct authorization check, so bounding them
+    here would hide models that check still authorizes."""
+    from unittest.mock import AsyncMock, patch
+
+    from litellm.proxy._types import LiteLLM_UserTable, ProxyException
+    from litellm.proxy.auth.auth_checks import can_user_call_model
+    from litellm.proxy.utils import filter_models_by_user_access
+
+    user_object = LiteLLM_UserTable(
+        user_id="u", models=list(user_models), access_group_ids=["g1"] if group_models else []
+    )
+
+    with patch(
+        "litellm.proxy.auth.auth_checks._get_models_from_access_groups",
+        AsyncMock(return_value=list(group_models)),
+    ):
+        filtered = await filter_models_by_user_access(
+            models=list(candidates), user_object=user_object, llm_router=None
+        )
+        authoritative = []
+        for model in candidates:
+            try:
+                await can_user_call_model(model=model, llm_router=None, user_object=user_object)
+                authoritative.append(model)
+            except ProxyException:
+                pass
+
+    assert filtered == authoritative

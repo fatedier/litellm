@@ -265,6 +265,7 @@ model LiteLLM_UserTable {
     invitations_updated LiteLLM_InvitationLink[] @relation("UpdatedBy")
     invitations_user    LiteLLM_InvitationLink[] @relation("UserId")
     object_permission LiteLLM_ObjectPermissionTable?   @relation(fields: [object_permission_id], references: [object_permission_id])
+    access_group_memberships LiteLLM_UserAccessGroupMembership[]
 }
 
 model LiteLLM_ObjectPermissionTable {
@@ -1335,6 +1336,20 @@ model LiteLLM_AccessGroupTable {
   created_by         String?
   updated_at         DateTime @default(now()) @updatedAt
   updated_by         String?
+
+  user_memberships   LiteLLM_UserAccessGroupMembership[]
+}
+
+model LiteLLM_UserAccessGroupMembership {
+  user_id         String
+  access_group_id String
+  created_at      DateTime @default(now())
+
+  user LiteLLM_UserTable @relation(fields: [user_id], references: [user_id], onDelete: Cascade)
+  access_group LiteLLM_AccessGroupTable @relation(fields: [access_group_id], references: [access_group_id])
+
+  @@id([user_id, access_group_id])
+  @@index([access_group_id])
 }
 // Claude Code Plugin Marketplace table
 model LiteLLM_ClaudeCodePluginTable {

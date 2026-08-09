@@ -44,6 +44,7 @@ class LiteLLM_UserTable(LiteLLMPydanticObjectBase):
     updated_at: datetime | None = None
     organization_memberships: list[LiteLLM_OrganizationMembershipTable] | None = None
     object_permission: LiteLLM_ObjectPermissionTable | None = None
+    access_group_ids: list[str] = []
 
     model_config = ConfigDict(protected_namespaces=())
 
@@ -56,6 +57,8 @@ class LiteLLM_UserTable(LiteLLMPydanticObjectBase):
             values.update({"models": []})
         if values.get("teams") is None:
             values.update({"teams": []})
+        if values.get("access_group_ids") is None:
+            values.update({"access_group_ids": []})
         return values
 
     def is_over_budget(self) -> bool:

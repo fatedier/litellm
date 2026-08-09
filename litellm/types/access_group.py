@@ -36,3 +36,4 @@ class AccessGroupResponse(BaseModel):
     created_by: str | None = None
     updated_at: datetime
     updated_by: str | None = None
+    user_count: int

@@ -33,6 +33,9 @@ from litellm.models.tag import LiteLLM_TagTable
 from litellm.models.team import LiteLLM_TeamTable
 from litellm.models.team_membership import LiteLLM_TeamMembership
 from litellm.models.user import LiteLLM_UserTable
+from litellm.models.user_access_group_membership import (
+    LiteLLM_UserAccessGroupMembershipTable,
+)
 from litellm.models.verification_token import LiteLLM_VerificationToken
 
 __all__ = [
@@ -62,5 +65,6 @@ __all__ = [
     "LiteLLM_TeamMembership",
     "LiteLLM_TeamTable",
     "LiteLLM_UserTable",
+    "LiteLLM_UserAccessGroupMembershipTable",
     "LiteLLM_VerificationToken",
 ]

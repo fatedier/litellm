@@ -15,7 +15,21 @@ import re
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal, Optional, Protocol, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Final,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Protocol,
+    Tuple,
+    Type,
+    Union,
+    cast,
+)
 
 from fastapi import HTTPException, Request, status
 from pydantic import BaseModel
@@ -837,6 +851,26 @@ BUDGET_ENFORCED_SIDE_EFFECT_ROUTES: Final = frozenset(
 )
 
 
+def _user_acl_was_expected(
+    valid_token: Optional[UserAPIKeyAuth],
+    prisma_client: Optional[PrismaClient],
+) -> bool:
+    """True when a personal key should have carried a user object to check.
+
+    Distinguishes a legitimately absent user ACL (no user on the key, an admin
+    key, or a deployment with no user records at all) from one that failed to
+    load, which must not be read as "unrestricted".
+    """
+    if valid_token is None or valid_token.user_id is None:
+        return False
+    if valid_token.user_role in (
+        LitellmUserRoles.PROXY_ADMIN,
+        LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY,
+    ):
+        return False
+    return prisma_client is not None
+
+
 async def common_checks(
     request_body: dict,
     team_object: LiteLLM_TeamTable | None,
@@ -945,12 +979,23 @@ async def common_checks(
                     )
 
     ## 2.1 If user can call model (if personal key)
-    if _model and team_object is None and user_object is not None:
-        with tracer.trace("litellm.proxy.auth.common_checks.can_user_call_model"):
-            await can_user_call_model(
-                model=_model,
-                llm_router=llm_router,
-                user_object=user_object,
+    if _model and team_object is None:
+        if user_object is not None:
+            with tracer.trace("litellm.proxy.auth.common_checks.can_user_call_model"):
+                await can_user_call_model(
+                    model=_model,
+                    llm_router=llm_router,
+                    user_object=user_object,
+                )
+        elif _user_acl_was_expected(valid_token=valid_token, prisma_client=prisma_client):
+            # The user's models and access groups live only on the user object,
+            # so continuing without it would drop the restriction entirely and
+            # serve a restricted user every model on the proxy.
+            raise ProxyException(
+                message="Could not verify user model access. Please retry.",
+                type=ProxyErrorTypes.internal_server_error,
+                param="model",
+                code=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
     # 1.1 - 2.2 - 3.0.2 - 3.0.3: Project checks (blocked, model access, budget)
@@ -1947,7 +1992,7 @@ async def _get_fuzzy_user_object(
     if sso_user_id is not None:
         response = await _user_table(UserRepository(prisma_client)).find_unique(
             where={"sso_user_id": sso_user_id},
-            include={"organization_memberships": True},
+            include={"organization_memberships": True, "access_group_memberships": True},
         )
 
     if response is None and user_email is not None:
@@ -1955,7 +2000,7 @@ async def _get_fuzzy_user_object(
         # This matches the pattern used in _check_duplicate_user_email
         response = await _user_table(UserRepository(prisma_client)).find_first(
             where={"user_email": {"equals": user_email, "mode": "insensitive"}},
-            include={"organization_memberships": True},
+            include={"organization_memberships": True, "access_group_memberships": True},
         )
 
         if response is not None and sso_user_id is not None:  # update sso_user_id
@@ -2044,7 +2089,7 @@ async def get_user_object(
 
         if should_check_db:
             response = await _user_table(UserRepository(prisma_client)).find_unique(
-                where={"user_id": user_id}, include={"organization_memberships": True}
+                where={"user_id": user_id}, include={"organization_memberships": True, "access_group_memberships": True}
             )
 
             if response is None:
@@ -2083,7 +2128,7 @@ async def get_user_object(
 
                 response = await _user_table(UserRepository(prisma_client)).create(
                     data=new_user_params,
-                    include={"organization_memberships": True},
+                    include={"organization_memberships": True, "access_group_memberships": True},
                 )
 
                 default_teams: Final = check_if_default_team_set()
@@ -2119,6 +2164,13 @@ async def get_user_object(
             user_api_key_cache=user_api_key_cache,
             user_row=_response,
             user_email=user_email,
+        )
+        _access_group_memberships = getattr(response, "access_group_memberships", None) or []
+        _response = LiteLLM_UserTable.model_validate(
+            {
+                **_response.model_dump(),
+                "access_group_ids": [membership.access_group_id for membership in _access_group_memberships],
+            }
         )
         response_dict: Final = _response.model_dump()
 
@@ -3841,28 +3893,146 @@ def can_project_access_model(
     )
 
 
+MAX_MODEL_NAME_LENGTH_FOR_PATTERN_MATCH = 4096
+MAX_WILDCARDS_FOR_PATTERN_MATCH = 2
+
+
+def bounded_models_for_pattern_match(
+    model: str,
+    models: List[str],
+) -> Optional[List[str]]:
+    """Drop allowlist entries too expensive to match this candidate against.
+
+    A wildcard entry becomes a backtracking regex whose cost rises with both the
+    caller-supplied name's length and the pattern's wildcard count, so bounding
+    one alone leaves the other open: two wildcards over 4096 characters costs
+    8ms, but four wildcards need only 1024 characters to burn seconds, all ahead
+    of budget and rate-limit checks. Only wildcard entries are dropped, since
+    exact names cost nothing to compare and a pattern the caller cannot exploit
+    should not revoke access another entry grants.
+
+    The bound describes one candidate, so a request naming several models has to
+    ask per model: an oversized name among them must not strip the wildcards the
+    short ones are granted through.
+
+    Returns ``None`` when nothing safe is left to match a non-empty allowlist
+    against, which callers must treat as a denial: an empty list reaching
+    ``_can_object_call_model`` reads as unrestricted access.
+    """
+    candidate_past_length_bound = len(model) > MAX_MODEL_NAME_LENGTH_FOR_PATTERN_MATCH
+    bounded = [
+        entry
+        for entry in models
+        if "*" not in entry or (not candidate_past_length_bound and entry.count("*") <= MAX_WILDCARDS_FOR_PATTERN_MATCH)
+    ]
+    if models and not bounded:
+        return None
+    return bounded
+
+
+class UserEffectiveModels(NamedTuple):
+    """A user's allowlist, split by where each entry came from.
+
+    The halves are matched differently, so they cannot be merged: entries the
+    user holds directly are matched the way the check above matches them, while
+    access group entries carry the cost bound this feature's grants are subject
+    to. An entry present in both counts as direct, since a bound on the group
+    copy would protect nothing.
+    """
+
+    direct: Tuple[str, ...]
+    group: Tuple[str, ...]
+
+
+async def resolve_user_effective_models(
+    user_object: LiteLLM_UserTable,
+) -> Optional[UserEffectiveModels]:
+    """Return the allowlist a user's own models and access groups add up to.
+
+    ``None`` means "no allowlist applies" — an empty models field grants every
+    model, so callers must not read it as an empty allowlist. Resolving here
+    lets a caller that tests many models read the groups once instead of on
+    every check; ``can_user_call_model`` stays the authority for a single
+    decision.
+    """
+    direct_models = () if SpecialModelNames.no_default_models.value in user_object.models else tuple(user_object.models)
+    if not direct_models and SpecialModelNames.no_default_models.value not in user_object.models:
+        return None
+
+    access_group_ids = user_object.access_group_ids or []
+    group_models = (
+        tuple(await _get_models_from_access_groups(access_group_ids=access_group_ids)) if access_group_ids else ()
+    )
+
+    if any(entry in (*direct_models, *group_models) for entry in ("*", SpecialModelNames.all_proxy_models.value)):
+        return None
+    return UserEffectiveModels(
+        direct=tuple(dict.fromkeys(direct_models)),
+        group=tuple(entry for entry in dict.fromkeys(group_models) if entry not in direct_models),
+    )
+
+
 async def can_user_call_model(
     model: str | list[str],
     llm_router: Router | None,
     user_object: LiteLLM_UserTable | None,
 ) -> Literal[True]:
+    """Authorize a personal key's request against the user's models and access groups.
+
+    Group-only users are configured as models=["no-default-models"] plus access
+    groups, and they must be issued a key through /key/generate. A key created by
+    /user/new with auto_create_key inherits that sentinel into its own allowlist,
+    and can_key_call_model runs before common_checks reaches this function, so
+    such a key is refused at the key layer and never reaches the group fallback
+    below. Teams do not hit this because their all-team-models sentinel expands
+    rather than restricts. Left as is deliberately: the sentinel is a user-level
+    concept and stripping it from generated keys would change upstream /user/new
+    behavior for a path no first-party caller uses.
+    """
     if user_object is None:
         return True
 
-    if SpecialModelNames.no_default_models.value in user_object.models:
-        raise ProxyException(
-            message=f"User not allowed to access model. No default model access, only team models allowed. Tried to access {model}",
-            type=ProxyErrorTypes.key_model_access_denied,
-            param="model",
-            code=status.HTTP_403_FORBIDDEN,
-        )
+    try:
+        if SpecialModelNames.no_default_models.value in user_object.models:
+            raise ProxyException(
+                message=f"User not allowed to access model. No default model access, only team models allowed. Tried to access {model}",
+                type=ProxyErrorTypes.key_model_access_denied,
+                param="model",
+                code=status.HTTP_403_FORBIDDEN,
+            )
 
-    return _can_object_call_model(
-        model=model,
-        llm_router=llm_router,
-        models=user_object.models,
-        object_type="user",
-    )
+        return _can_object_call_model(
+            model=model,
+            llm_router=llm_router,
+            models=user_object.models,
+            object_type="user",
+        )
+    except ProxyException:
+        if not user_object.access_group_ids:
+            raise
+
+        # A request can name several models at once, drawing one from the user's
+        # own allowlist and another from a group, so the retry runs against both
+        # sources together. The sentinel voids the direct allowlist, so it
+        # contributes nothing to the union.
+        effective_models = await resolve_user_effective_models(user_object=user_object)
+        if effective_models is None:
+            return True
+        if not effective_models.group:
+            raise
+
+        for candidate in model if isinstance(model, list) else [model]:
+            bounded_group = bounded_models_for_pattern_match(model=candidate, models=list(effective_models.group))
+            usable_models = [*effective_models.direct, *(bounded_group or ())]
+            if not usable_models:
+                raise
+            _can_object_call_model(
+                model=candidate,
+                llm_router=llm_router,
+                models=usable_models,
+                object_type="user",
+            )
+        return True
 
 
 def _search_tool_names_from_object_permission(

@@ -13,6 +13,7 @@ These are members of a Team on LiteLLM
 """
 
 import asyncio
+import inspect
 import json
 import traceback
 from collections.abc import Mapping, Sequence
@@ -201,6 +202,86 @@ def _update_internal_new_user_params(data_json: dict, data: NewUserRequest) -> d
 
     data_json.pop("teams", None)  # handled separately
     return data_json
+
+
+def _normalize_access_group_ids(raw_access_group_ids: list[str] | None) -> list[str]:
+    return list(dict.fromkeys(raw_access_group_ids or []))
+
+
+USER_ACCESS_GROUP_INCLUDE: dict[str, bool] = {"access_group_memberships": True}
+
+
+def _access_group_ids_from_row(user_row: Any) -> list[str]:
+    """Project the membership join rows a query included back onto a flat id list.
+
+    Memberships live in their own table, so a read that does not ask for them
+    leaves the field at its pydantic default and the caller cannot tell an
+    unloaded relation from a user with no groups. Every read that surfaces
+    access_group_ids must therefore query with USER_ACCESS_GROUP_INCLUDE.
+    """
+    memberships = getattr(user_row, "access_group_memberships", None) or []
+    return [membership.access_group_id for membership in memberships]
+
+
+def _enforce_admin_can_manage_access_groups(user_api_key_dict: UserAPIKeyAuth) -> None:
+    """Only proxy admins may assign or clear a user's access group membership.
+
+    Access groups are global, org-unscoped objects, so a non-admin caller (an
+    org admin, or an internal user self-updating) must not be able to grant a
+    user models outside their scope by attaching the user to an arbitrary group.
+    """
+    if not isinstance(user_api_key_dict, UserAPIKeyAuth):
+        return
+    if user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "Only proxy admins can assign or clear user access groups."},
+        )
+
+
+async def _validate_access_group_ids_exist(access_group_ids: list[str]) -> None:
+    from litellm.proxy.auth.auth_checks import get_access_object
+    from litellm.proxy.proxy_server import (
+        prisma_client,
+        proxy_logging_obj,
+        user_api_key_cache,
+    )
+
+    for access_group_id in access_group_ids:
+        try:
+            await get_access_object(
+                access_group_id=access_group_id,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+        except HTTPException as e:
+            if e.status_code == status.HTTP_404_NOT_FOUND:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={"error": f"Access group={access_group_id} does not exist"},
+                ) from e
+            raise
+
+
+async def _replace_user_access_group_memberships(user_id: str, access_group_ids: list[str]) -> None:
+    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
+
+    if prisma_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": CommonProxyErrors.db_not_connected_error.value},
+        )
+
+    async with prisma_client.db.tx() as tx:
+        await tx.litellm_useraccessgroupmembership.delete_many(where={"user_id": user_id})
+        if access_group_ids:
+            await tx.litellm_useraccessgroupmembership.create_many(
+                data=[{"user_id": user_id, "access_group_id": access_group_id} for access_group_id in access_group_ids],
+                skip_duplicates=True,
+            )
+
+    await user_api_key_cache.async_delete_cache(key=user_id)
 
 
 async def _check_duplicate_user_field(
@@ -550,6 +631,12 @@ async def new_user(
         if teams is None:
             teams = check_if_default_team_set()
         organization_ids: Final = cast(list[str] | None, data_json.pop("organizations", None))
+        requested_access_group_ids = _normalize_access_group_ids(
+            cast(list[str] | None, data_json.pop("access_group_ids", None))
+        )
+        if requested_access_group_ids:
+            _enforce_admin_can_manage_access_groups(user_api_key_dict=user_api_key_dict)
+            await _validate_access_group_ids_exist(access_group_ids=requested_access_group_ids)
 
         response: Final = await generate_key_helper_fn(request_type="user", **data_json)
         # Admin UI Logic
@@ -586,6 +673,12 @@ async def new_user(
 
         special_keys: Final = ["token", "token_id"]
         response_dict: Final = {}
+        if requested_access_group_ids and user_id is not None:
+            await _replace_user_access_group_memberships(
+                user_id=user_id,
+                access_group_ids=requested_access_group_ids,
+            )
+
         for key, value in response.items():
             if key in NewUserResponse.model_fields and key not in special_keys:
                 response_dict[key] = value
@@ -807,6 +900,7 @@ def _build_user_info_response(
     keys: list[LiteLLM_VerificationToken] | None,
     team_list: list[Any],
     teams_1: list[Any] | None,
+    access_group_ids: list[str] | None = None,
 ) -> UserInfoResponse:
     """Create UserInfoResponse while filtering sensitive fields."""
     if user_info is None and keys is not None:
@@ -820,6 +914,8 @@ def _build_user_info_response(
     if isinstance(_user_info, dict):
         _user_info.pop("password", None)
         _user_info["metadata"] = _redact_scim_enterprise_metadata(_user_info.get("metadata"))
+        if access_group_ids is not None:
+            _user_info["access_group_ids"] = access_group_ids
 
     return UserInfoResponse(
         user_id=user_id,
@@ -880,6 +976,16 @@ async def user_info(
                 detail=f"User {user_id} not found",
             )
 
+        # get_data is shared by many endpoints and does not load relations, so the
+        # memberships are read here rather than by widening it for every caller.
+        membership_row = UserRepository(prisma_client).table.find_unique(
+            where={"user_id": user_id},
+            include=USER_ACCESS_GROUP_INCLUDE,
+        )
+        if inspect.isawaitable(membership_row):
+            membership_row = await membership_row
+        user_access_group_ids = _access_group_ids_from_row(membership_row)
+
         team_list, teams_1 = await _get_user_info_teams(
             prisma_client=prisma_client,
             user_id=user_id,
@@ -900,6 +1006,7 @@ async def user_info(
             keys=keys,
             team_list=team_list,
             teams_1=teams_1,
+            access_group_ids=user_access_group_ids,
         )
 
         return response_data
@@ -934,7 +1041,8 @@ async def _check_user_info_v2_access(
     # callers can read the user's MCP/vector-store entitlements without a second round trip.
     async def _fetch_target_user():
         return await _user_table(prisma_client).find_unique(
-            where={"user_id": target_user_id}, include={"object_permission": True}
+            where={"user_id": target_user_id},
+            include={"object_permission": True, **USER_ACCESS_GROUP_INCLUDE},
         )
 
     # Rule 1: Proxy admins — fetch and return the target row directly
@@ -1052,6 +1160,7 @@ async def user_info_v2(
             sso_user_id=user_data.get("sso_user_id"),
             teams=user_data.get("teams") or [],
             object_permission=user_data.get("object_permission"),
+            access_group_ids=_access_group_ids_from_row(user_row),
         )
     except Exception as e:
         verbose_proxy_logger.exception("litellm.proxy.proxy_server.user_info_v2(): Exception occured - %s", e)
@@ -1353,6 +1462,8 @@ async def _update_single_user_helper(
     )
 
     data_json: Final[dict] = user_request.model_dump(exclude_unset=True)
+    access_group_ids_set = "access_group_ids" in data_json
+    raw_access_group_ids = cast(list[str] | None, data_json.pop("access_group_ids", None))
     non_default_values = _update_internal_user_params(data_json=data_json, data=user_request)
     _hash_password_in_dict(non_default_values)
 
@@ -1391,6 +1502,17 @@ async def _update_single_user_helper(
                         "error": f"Non-admin users cannot modify '{_field}' on their own record. Contact your proxy admin."
                     },
                 )
+
+    if access_group_ids_set:
+        _enforce_admin_can_manage_access_groups(user_api_key_dict=user_api_key_dict)
+    if access_group_ids_set and raw_access_group_ids is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "access_group_ids cannot be null; pass [] to clear all access groups"},
+        )
+    requested_access_group_ids = _normalize_access_group_ids(raw_access_group_ids)
+    if requested_access_group_ids:
+        await _validate_access_group_ids_exist(access_group_ids=requested_access_group_ids)
 
     existing_metadata: Final = (
         cast(dict, getattr(existing_user_row, "metadata", {}) or {}) if existing_user_row is not None else {}
@@ -1477,6 +1599,13 @@ async def _update_single_user_helper(
                     if isinstance(permission_id, str)
                 ),
             )
+        if access_group_ids_set:
+            _membership_user_id = cast(str | None, response.get("user_id", None)) or _target_user_id
+            if _membership_user_id is not None:
+                await _replace_user_access_group_memberships(
+                    user_id=_membership_user_id,
+                    access_group_ids=requested_access_group_ids,
+                )
 
     if response is None:
         raise HTTPException(
@@ -2014,6 +2143,10 @@ async def get_users(
     sso_user_ids: str | None = fastapi.Query(default=None, description="Get list of users by sso_user_id"),
     user_email: str | None = fastapi.Query(default=None, description="Filter users by partial email match"),
     team: str | None = fastapi.Query(default=None, description="Filter users by team id"),
+    access_group_id: str | None = fastapi.Query(
+        default=None,
+        description="Filter users by access group membership",
+    ),
     page: int = fastapi.Query(default=1, ge=1, description="Page number"),
     page_size: int = fastapi.Query(default=25, ge=1, le=100, description="Number of items per page"),
     sort_by: str | None = fastapi.Query(
@@ -2107,6 +2240,9 @@ async def get_users(
             "has": team  # Array contains for string arrays in Prisma
         }
 
+    if access_group_id is not None and isinstance(access_group_id, str):
+        where_conditions["access_group_memberships"] = {"some": {"access_group_id": access_group_id}}
+
     if sso_user_ids is not None and isinstance(sso_user_ids, str):
         sso_id_list: Final = [sid.strip() for sid in sso_user_ids.split(",") if sid.strip()]
         where_conditions["sso_user_id"] = {
@@ -2132,6 +2268,7 @@ async def get_users(
         skip=skip,
         take=page_size,
         order=(order_by if order_by else {"created_at": "desc"}),  # Default to created_at desc if no sort specified
+        include=USER_ACCESS_GROUP_INCLUDE,
     )
 
     # Get total count of user rows
@@ -2154,6 +2291,7 @@ async def get_users(
         for user in users:
             user_dump = user.model_dump()
             user_dump["metadata"] = _redact_scim_enterprise_metadata(user_dump.get("metadata"))
+            user_dump["access_group_ids"] = _access_group_ids_from_row(user)
             user_list.append(
                 LiteLLM_UserTableWithKeyCount.model_validate(
                     {**user_dump, "key_count": user_key_counts.get(user.user_id, 0)}

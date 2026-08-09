@@ -9586,6 +9586,59 @@ def _append_advertised_models_to_model_data(
     return model_data
 
 
+async def _get_user_object_for_model_filtering(
+    user_api_key_dict: UserAPIKeyAuth,
+) -> "LiteLLM_UserTable | None":
+    """Resolve the user whose models and access groups should scope a listing.
+
+    Only /v1/models and /v1/models/{model_id} pass this through. /model/info,
+    /v1/model/info, /v2/model/info and /model_group/info still enumerate router
+    deployments unfiltered, so a restricted personal key can read model names and
+    metadata there for models it cannot call. That gap predates access groups and
+    applies to plain user.models just the same; it is left open because those
+    routes are control-plane surfaces here, not endpoints exposed to end users.
+    Revisit if that exposure changes: model_info_v1 would also need
+    get_direct_access_models taught about access groups, since it derives
+    direct_access from user.models alone.
+
+    Returns None when no filtering applies. A failure to load the ACL raises
+    instead, because callers read None as unrestricted.
+    """
+    from litellm.proxy.auth.auth_checks import get_user_object
+
+    if user_api_key_dict.team_id is not None or user_api_key_dict.user_id is None:
+        return None
+    if user_api_key_dict.user_role in (
+        LitellmUserRoles.PROXY_ADMIN,
+        LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY,
+    ):
+        return None
+    if prisma_client is None or user_api_key_cache is None:
+        return None
+    try:
+        return await get_user_object(
+            user_id=user_api_key_dict.user_id,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            user_id_upsert=False,
+            parent_otel_span=user_api_key_dict.parent_otel_span,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+    except Exception as e:
+        # Every "no filtering applies" case returned None above. Reaching here
+        # means the ACL could not be read, and callers read None as
+        # unrestricted, so surfacing the failure is what keeps the listing from
+        # advertising models this user cannot call.
+        verbose_proxy_logger.exception(
+            "Could not load user access control for model discovery. user_id=%s",
+            user_api_key_dict.user_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "Could not verify user model access. Please retry."},
+        ) from e
+
+
 @router.get("/v1/models", dependencies=[Depends(user_api_key_auth)], tags=["model management"])
 @router.get(
     "/models", dependencies=[Depends(user_api_key_auth)], tags=["model management"]
@@ -9756,6 +9809,7 @@ async def model_list(
         only_model_access_groups=only_model_access_groups or False,
         return_wildcard_routes=return_wildcard_routes or False,
         user_api_key_cache=user_api_key_cache,
+        user_object=await _get_user_object_for_model_filtering(user_api_key_dict),
     )
 
     # Hide paused/unhealthy models from the public listing
@@ -9844,6 +9898,7 @@ async def model_info(
         only_model_access_groups=False,
         return_wildcard_routes=False,
         user_api_key_cache=user_api_key_cache,
+        user_object=await _get_user_object_for_model_filtering(user_api_key_dict),
     )
 
     # Mirror /v1/models' visibility filter so first-occurrence resolution

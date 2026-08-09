@@ -3013,6 +3013,7 @@ async def test_user_info_v2_response_shape(mocker):
         "sso_user_id",
         "teams",
         "object_permission",
+        "access_group_ids",
     }
     assert set(response_dict.keys()) == expected_fields
 
