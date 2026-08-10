@@ -2148,7 +2148,7 @@ async def get_users(
         description="Filter users by access group membership",
     ),
     page: int = fastapi.Query(default=1, ge=1, description="Page number"),
-    page_size: int = fastapi.Query(default=25, ge=1, le=100, description="Number of items per page"),
+    page_size: int = fastapi.Query(default=25, ge=1, le=1000, description="Number of items per page"),
     sort_by: str | None = fastapi.Query(
         default=None,
         description="Column to sort by (e.g. 'user_id', 'user_email', 'created_at', 'spend')",
