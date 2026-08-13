@@ -4305,7 +4305,8 @@ class TestGetOptionalParamsTencent:
                 custom_llm_provider="tencent",
                 thinking={"type": "enabled"},
             )
-        assert result.get("thinking") == {"type": "enabled"}
+        assert result["extra_body"]["thinking"] == {"type": "enabled"}
+        assert "thinking" not in result
 
     def test_tencent_supports_reasoning_effort(self):
         """Verify get_optional_params for tencent converts reasoning_effort to thinking."""
@@ -4322,7 +4323,8 @@ class TestGetOptionalParamsTencent:
                 custom_llm_provider="tencent",
                 reasoning_effort="medium",
             )
-        assert result.get("thinking") == {"type": "enabled"}
+        assert result["extra_body"]["thinking"] == {"type": "enabled"}
+        assert "thinking" not in result
 
     def test_tencent_supported_params_includes_thinking_and_reasoning_effort(self):
         """Verify get_supported_openai_params for tencent includes custom params."""

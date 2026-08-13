@@ -32,9 +32,21 @@ class TencentChatConfig(OpenAIGPTConfig):
 
         if thinking_value is not None:
             if isinstance(thinking_value, dict):
-                optional_params["thinking"] = thinking_value
+                return {
+                    **optional_params,
+                    "extra_body": {
+                        **(optional_params.get("extra_body") or {}),
+                        "thinking": thinking_value,
+                    },
+                }
         elif reasoning_effort is not None and reasoning_effort != "none":
-            optional_params["thinking"] = {"type": "enabled"}
+            return {
+                **optional_params,
+                "extra_body": {
+                    **(optional_params.get("extra_body") or {}),
+                    "thinking": {"type": "enabled"},
+                },
+            }
 
         return optional_params
 

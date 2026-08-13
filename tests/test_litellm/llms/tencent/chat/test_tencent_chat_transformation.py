@@ -45,7 +45,8 @@ def test_map_openai_params_passes_thinking_dict_through():
             drop_params=False,
         )
 
-    assert result["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+    assert result["extra_body"]["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+    assert "thinking" not in result
 
 
 def test_map_openai_params_converts_reasoning_effort_to_thinking():
@@ -61,7 +62,8 @@ def test_map_openai_params_converts_reasoning_effort_to_thinking():
             drop_params=False,
         )
 
-    assert result["thinking"] == {"type": "enabled"}
+    assert result["extra_body"]["thinking"] == {"type": "enabled"}
+    assert "thinking" not in result
 
 
 def test_map_openai_params_drops_none_reasoning_effort():
@@ -97,7 +99,8 @@ def test_map_openai_params_thinking_priority_over_reasoning_effort():
             drop_params=False,
         )
 
-    assert result["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+    assert result["extra_body"]["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+    assert "thinking" not in result
 
 
 def test_map_openai_params_extracts_thinking_and_effort_from_optional_params():
@@ -109,7 +112,8 @@ def test_map_openai_params_extracts_thinking_and_effort_from_optional_params():
         drop_params=False,
     )
 
-    assert "thinking" in result
+    assert result["extra_body"]["thinking"] == {"type": "enabled"}
+    assert "thinking" not in result
     assert "reasoning_effort" not in result
 
 
