@@ -2109,6 +2109,68 @@ def test_usage_chunk_after_finish_reason_updates_hidden_params(logging_obj):
     ), f"Expected completion_tokens=135 from provider, got {hidden_usage.completion_tokens}"
 
 
+def test_zai_combined_finish_and_usage_chunk_preserves_cache_details(logging_obj):
+    from openai.types.chat import ChatCompletionChunk
+
+    chunks = [
+        ChatCompletionChunk.model_validate(
+            {
+                "id": "chatcmpl-zai-cache",
+                "object": "chat.completion.chunk",
+                "created": 1786712710,
+                "model": "glm-5.2",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": "OK"},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        ),
+        ChatCompletionChunk.model_validate(
+            {
+                "id": "chatcmpl-zai-cache",
+                "object": "chat.completion.chunk",
+                "created": 1786712710,
+                "model": "glm-5.2",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": ""},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 36019,
+                    "completion_tokens": 3,
+                    "total_tokens": 36022,
+                    "prompt_tokens_details": {"cached_tokens": 35968},
+                },
+            }
+        ),
+    ]
+    wrapper = CustomStreamWrapper(
+        completion_stream=ModelResponseListIterator(model_responses=chunks),
+        model="zai/glm-5.2",
+        logging_obj=logging_obj,
+        custom_llm_provider="zai",
+        stream_options={"include_usage": True},
+    )
+
+    collected_chunks = list(wrapper)
+    response = litellm.stream_chunk_builder(
+        chunks=collected_chunks,
+        messages=[{"role": "user", "content": "Reply with OK only."}],
+    )
+
+    assert response is not None
+    assert response.usage.prompt_tokens == 36019
+    assert response.usage.completion_tokens == 3
+    assert response.usage.prompt_tokens_details is not None
+    assert response.usage.prompt_tokens_details.cached_tokens == 35968
+
+
 @pytest.mark.asyncio
 async def test_custom_stream_wrapper_aclose():
     """Test that aclose() delegates to the underlying completion_stream's aclose()"""
