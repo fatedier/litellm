@@ -8269,6 +8269,12 @@ class ProviderConfigManager:
             )
 
             return TencentAnthropicMessagesConfig()
+        elif litellm.LlmProviders.ZAI == provider:
+            from litellm.llms.zai.messages.transformation import (
+                ZAIAnthropicMessagesConfig,
+            )
+
+            return ZAIAnthropicMessagesConfig()
         elif litellm.LlmProviders.GITHUB_COPILOT == provider:
             if "claude" in model_lower:
                 from litellm.llms.github_copilot.messages.transformation import (
