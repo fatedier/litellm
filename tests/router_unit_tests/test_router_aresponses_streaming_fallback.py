@@ -512,3 +512,42 @@ async def test_aresponses_client_error_event_skips_fallback():
 
     assert exc_info.value.status_code == 400
     mock_fallback.assert_not_awaited()
+
+
+def test_extract_partial_responses_usage_native_failed_with_dict_response():
+    """Regression: transform_streaming_response falls back to model_construct
+    when a terminal chunk fails validation, leaving `response` as a raw dict.
+    Usage extraction must not crash with
+    "'dict' object has no attribute 'usage'"."""
+    from litellm.types.llms.openai import ResponseFailedEvent
+
+    failed = ResponseFailedEvent.model_construct(
+        type=ResponsesAPIStreamEvents.RESPONSE_FAILED,
+        response={
+            "id": "resp_123",
+            "status": "failed",
+            "usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+        },
+    )
+    source = MagicMock()
+    source.completed_response = failed
+
+    usage = Router._extract_partial_responses_usage(source)
+    assert usage is not None
+    assert usage.input_tokens == 11
+    assert usage.output_tokens == 7
+    assert usage.total_tokens == 18
+
+
+def test_extract_partial_responses_usage_native_dict_response_without_usage():
+    """Same model_construct fallback shape but no usage key → None, no crash."""
+    from litellm.types.llms.openai import ResponseFailedEvent
+
+    failed = ResponseFailedEvent.model_construct(
+        type=ResponsesAPIStreamEvents.RESPONSE_FAILED,
+        response={"id": "resp_123", "status": "failed"},
+    )
+    source = MagicMock()
+    source.completed_response = failed
+
+    assert Router._extract_partial_responses_usage(source) is None

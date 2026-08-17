@@ -2390,6 +2390,8 @@ class Router:
 
         Returns None when no partial usage is recoverable.
         """
+        from pydantic import ValidationError
+
         from litellm.responses.litellm_completion_transformation.streaming_iterator import (
             LiteLLMCompletionStreamingIterator,
         )
@@ -2440,7 +2442,18 @@ class Router:
             completed,
             (ResponseCompletedEvent, ResponseFailedEvent, ResponseIncompleteEvent),
         ):
-            return completed.response.usage
+            response_obj = completed.response
+            usage = (
+                cast("dict[str, object]", response_obj).get("usage")
+                if isinstance(response_obj, dict)
+                else response_obj.usage
+            )
+            if isinstance(usage, dict):
+                try:
+                    return ResponseAPIUsage.model_validate(usage)
+                except ValidationError:
+                    return None
+            return usage if isinstance(usage, ResponseAPIUsage) else None
         return None
 
     @staticmethod
