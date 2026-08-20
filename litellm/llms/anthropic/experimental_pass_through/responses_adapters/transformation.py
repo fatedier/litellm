@@ -264,7 +264,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             tool_name = tool_dict.get("name", "")
             # web_search tool
             if (isinstance(tool_type, str) and tool_type.startswith("web_search")) or tool_name == "web_search":
-                result.append({"type": "web_search_preview"})
+                result.append({"type": "web_search"})
                 continue
             func_tool: dict[str, Any] = {"type": "function", "name": tool_name}
             if "description" in tool_dict:
