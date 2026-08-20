@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 
 from .conftest import VOLATILE_KEYS, normalize
 
@@ -152,6 +153,16 @@ def test_reload_model_cost_map_no_db_500(client, auth_as, monkeypatch):
     assert "Database connection not available" in response.json().get("detail", "")
 
 
+def test_reload_model_cost_map_conflicts_with_required_remote_catalog(client, auth_as, monkeypatch):
+    from litellm.proxy._types import LitellmUserRoles
+
+    monkeypatch.setenv("LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE", "true")
+    with auth_as(LitellmUserRoles.PROXY_ADMIN):
+        response = client.post("/reload/model_cost_map")
+    assert response.status_code == 409
+    assert "Manual model cost map reload is disabled" in response.json().get("detail", "")
+
+
 # ---------------------------------------------------------------------------
 # POST /schedule/model_cost_map_reload
 # ---------------------------------------------------------------------------
@@ -214,6 +225,17 @@ def test_schedule_model_cost_map_reload_not_admin_forbidden(client, auth_as):
     assert "Admin role required" in response.json().get("detail", "")
 
 
+def test_schedule_model_cost_map_reload_conflicts_with_required_remote_catalog(client, auth_as, monkeypatch):
+    from litellm.proxy._types import LitellmUserRoles
+
+    monkeypatch.setenv("LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE", "true")
+    monkeypatch.delenv("LITELLM_MODEL_COST_MAP_RELOAD_INTERVAL_SECONDS", raising=False)
+    with auth_as(LitellmUserRoles.PROXY_ADMIN):
+        response = client.post("/schedule/model_cost_map_reload?hours=6")
+    assert response.status_code == 409
+    assert "disabled when LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE=true" in response.json().get("detail", "")
+
+
 # ---------------------------------------------------------------------------
 # DELETE /schedule/model_cost_map_reload
 # ---------------------------------------------------------------------------
@@ -262,6 +284,17 @@ def test_cancel_model_cost_map_reload_no_db_500(client, auth_as, monkeypatch):
     assert "Database connection not available" in response.json().get("detail", "")
 
 
+def test_cancel_model_cost_map_reload_conflicts_with_required_remote_catalog(client, auth_as, monkeypatch):
+    from litellm.proxy._types import LitellmUserRoles
+
+    monkeypatch.setenv("LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE", "true")
+    monkeypatch.delenv("LITELLM_MODEL_COST_MAP_RELOAD_INTERVAL_SECONDS", raising=False)
+    with auth_as(LitellmUserRoles.PROXY_ADMIN):
+        response = client.delete("/schedule/model_cost_map_reload")
+    assert response.status_code == 409
+    assert "disabled when LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE=true" in response.json().get("detail", "")
+
+
 # ---------------------------------------------------------------------------
 # GET /schedule/model_cost_map_reload/status
 # ---------------------------------------------------------------------------
@@ -308,6 +341,58 @@ def test_get_model_cost_map_reload_status_scheduled(
         "scheduled": True,
         "interval_hours": 12,
         "last_run": None,
+        "next_run": None,
+    }
+
+
+def test_get_model_cost_map_reload_status_environment_managed(client, auth_as, monkeypatch):
+    from litellm.proxy._types import LitellmUserRoles
+
+    monkeypatch.setenv("LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE", "true")
+    monkeypatch.setenv("LITELLM_MODEL_COST_MAP_RELOAD_INTERVAL_SECONDS", "300")
+    monkeypatch.setattr(
+        "litellm.litellm_core_utils.get_model_cost_map.get_model_cost_map_source_info",
+        lambda: {
+            "last_success_at": "2026-08-18T00:00:00+00:00",
+            "next_run_at": "2026-08-18T00:10:00+00:00",
+        },
+    )
+
+    with auth_as(LitellmUserRoles.PROXY_ADMIN):
+        response = client.get("/schedule/model_cost_map_reload/status")
+    assert response.status_code == 200
+    assert normalize(response.json()) == {
+        "scheduled": True,
+        "interval_hours": None,
+        "interval_seconds": 300,
+        "managed_by": "environment",
+        "last_run": "2026-08-18T00:00:00+00:00",
+        "next_run": "2026-08-18T00:10:00+00:00",
+    }
+
+
+def test_get_model_cost_map_reload_status_required_remote_without_interval(client, auth_as, monkeypatch):
+    from litellm.proxy._types import LitellmUserRoles
+
+    monkeypatch.setenv("LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE", "true")
+    monkeypatch.delenv("LITELLM_MODEL_COST_MAP_RELOAD_INTERVAL_SECONDS", raising=False)
+    monkeypatch.setattr(
+        "litellm.litellm_core_utils.get_model_cost_map.get_model_cost_map_source_info",
+        lambda: {
+            "last_success_at": "2026-08-18T00:00:00+00:00",
+            "next_run_at": None,
+        },
+    )
+
+    with auth_as(LitellmUserRoles.PROXY_ADMIN):
+        response = client.get("/schedule/model_cost_map_reload/status")
+    assert response.status_code == 200
+    assert normalize(response.json()) == {
+        "scheduled": False,
+        "interval_hours": None,
+        "interval_seconds": None,
+        "managed_by": "environment",
+        "last_run": "2026-08-18T00:00:00+00:00",
         "next_run": None,
     }
 
@@ -438,6 +523,20 @@ def test_get_model_cost_map_source_admin_view_only_allowed(
         "fallback_reason": None,
         "model_count": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_database_reload_signal_is_ignored_for_required_remote_catalog(monkeypatch):
+    from litellm.proxy.proxy_server import ProxyConfig
+
+    monkeypatch.setenv("LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE", "true")
+    proxy_config = ProxyConfig()
+    mock_prisma = MagicMock()
+    mock_prisma.get_generic_data = AsyncMock()
+
+    await proxy_config._check_and_reload_model_cost_map(mock_prisma)
+
+    mock_prisma.get_generic_data.assert_not_awaited()
 
 
 def test_get_model_cost_map_source_not_admin_forbidden(client, auth_as):

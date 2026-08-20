@@ -8,6 +8,7 @@ import json
 import os
 import sys
 
+import httpx
 import pytest
 
 sys.path.insert(0, os.path.abspath("../../.."))
@@ -21,8 +22,15 @@ from litellm.litellm_core_utils.fallback_generalizations import (
 from litellm.litellm_core_utils.get_model_cost_map import (
     FALLBACK_GENERALIZATIONS_KEY,
     GetModelCostMap,
+    ModelCostMapLoadError,
     _count_model_entries,
     _finalize_model_cost_map,
+    get_model_cost_map,
+    get_model_cost_map_reload_interval_seconds,
+    get_required_remote_model_cost_map_snapshot,
+    get_required_remote_model_cost_map_keys,
+    set_required_remote_model_cost_map_snapshot,
+    set_required_remote_model_cost_map_keys,
 )
 
 
@@ -38,6 +46,174 @@ def _make_models(n: int) -> dict:
     return {
         f"model-{i}": {"litellm_provider": "openai", "mode": "chat"} for i in range(n)
     }
+
+
+def test_required_remote_catalog_is_authoritative_and_ignores_catalog_metadata(monkeypatch):
+    remote_map = {
+        "sample_spec": {"source": "customer"},
+        FALLBACK_GENERALIZATIONS_KEY: {
+            "rules": [
+                {
+                    "name": "unmaintained",
+                    "pattern": r"^unmaintained-",
+                    "model_info": {"litellm_provider": "openai"},
+                }
+            ]
+        },
+        "voyage/voyage-context-4": {
+            "litellm_provider": "voyage",
+            "mode": "embedding",
+            "input_cost_per_token": 1.2e-7,
+            "aliases": ["voyage/voyage-context-4-alias"],
+        },
+    }
+    expected_snapshot = {"voyage/voyage-context-4": remote_map["voyage/voyage-context-4"]}
+    previous_rules = list(get_fallback_generalization_rules())
+    previous_snapshot = get_required_remote_model_cost_map_snapshot()
+    previous_remote_keys = get_required_remote_model_cost_map_keys()
+    monkeypatch.setenv("LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE", "true")
+    monkeypatch.delenv("LITELLM_LOCAL_MODEL_COST_MAP", raising=False)
+    monkeypatch.delenv("LITELLM_MODEL_COST_MAP_PATH", raising=False)
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda url, timeout: httpx.Response(200, json=remote_map, request=httpx.Request("GET", url)),
+    )
+
+    try:
+        loaded = get_model_cost_map("https://example.invalid/prices.json")
+        assert loaded == {
+            "voyage/voyage-context-4": {
+                "litellm_provider": "voyage",
+                "mode": "embedding",
+                "input_cost_per_token": 1.2e-7,
+            },
+            "voyage/voyage-context-4-alias": {
+                "litellm_provider": "voyage",
+                "mode": "embedding",
+                "input_cost_per_token": 1.2e-7,
+            },
+        }
+        snapshot = get_required_remote_model_cost_map_snapshot()
+        assert snapshot == expected_snapshot
+        assert snapshot is not None
+        snapshot["voyage/voyage-context-4"]["input_cost_per_token"] = 1.0
+        assert get_required_remote_model_cost_map_snapshot() == expected_snapshot
+        assert match_routing_generalization("unmaintained-model") is None
+    finally:
+        set_fallback_generalizations(previous_rules)
+        set_required_remote_model_cost_map_snapshot(previous_snapshot)
+        set_required_remote_model_cost_map_keys(previous_remote_keys)
+
+
+@pytest.mark.parametrize(
+    "remote_map",
+    [
+        {},
+        {"sample_spec": {}},
+        {FALLBACK_GENERALIZATIONS_KEY: {"rules": []}},
+    ],
+)
+def test_required_remote_catalog_rejects_metadata_without_models(remote_map):
+    with pytest.raises(ModelCostMapLoadError, match="Remote model cost map"):
+        GetModelCostMap.prepare_required_remote_model_cost_map(remote_map)
+
+
+def test_required_remote_map_failure_does_not_fallback(monkeypatch):
+    monkeypatch.setenv("LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE", "true")
+    monkeypatch.delenv("LITELLM_LOCAL_MODEL_COST_MAP", raising=False)
+    monkeypatch.delenv("LITELLM_MODEL_COST_MAP_PATH", raising=False)
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda url, timeout: (_ for _ in ()).throw(httpx.ConnectError("unavailable")),
+    )
+
+    with pytest.raises(ModelCostMapLoadError, match="Failed to load required remote model cost map") as exc_info:
+        get_model_cost_map("https://user:secret@example.invalid/prices.json?token=secret")
+    assert "secret" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+def test_required_remote_map_unexpected_failure_does_not_fallback(monkeypatch):
+    monkeypatch.setenv("LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE", "true")
+    monkeypatch.delenv("LITELLM_LOCAL_MODEL_COST_MAP", raising=False)
+    monkeypatch.delenv("LITELLM_MODEL_COST_MAP_PATH", raising=False)
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda url, timeout: (_ for _ in ()).throw(RuntimeError("unexpected failure")),
+    )
+
+    with pytest.raises(ModelCostMapLoadError, match="RuntimeError"):
+        get_model_cost_map("https://example.invalid/prices.json")
+
+
+@pytest.mark.parametrize(
+    "remote_error",
+    [
+        httpx.InvalidURL("Invalid port"),
+        RuntimeError("unexpected failure"),
+    ],
+)
+def test_non_required_remote_failure_preserves_local_fallback(monkeypatch, remote_error):
+    monkeypatch.delenv("LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE", raising=False)
+    monkeypatch.delenv("LITELLM_LOCAL_MODEL_COST_MAP", raising=False)
+    monkeypatch.delenv("LITELLM_MODEL_COST_MAP_PATH", raising=False)
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda url, timeout: (_ for _ in ()).throw(remote_error),
+    )
+
+    loaded = get_model_cost_map("https://example.invalid:invalid/prices.json")
+
+    assert loaded
+    from litellm.litellm_core_utils.get_model_cost_map import get_model_cost_map_source_info
+
+    assert get_model_cost_map_source_info()["source"] == "local"
+
+
+def test_source_info_redacts_url_credentials_and_query(monkeypatch):
+    monkeypatch.delenv("LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE", raising=False)
+    monkeypatch.delenv("LITELLM_LOCAL_MODEL_COST_MAP", raising=False)
+    monkeypatch.delenv("LITELLM_MODEL_COST_MAP_PATH", raising=False)
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda url, timeout: (_ for _ in ()).throw(httpx.ConnectError("unavailable")),
+    )
+
+    get_model_cost_map("https://user:secret@example.invalid/prices.json?token=secret")
+
+    from litellm.litellm_core_utils.get_model_cost_map import get_model_cost_map_source_info
+
+    assert get_model_cost_map_source_info()["url"] == "https://example.invalid/prices.json"
+
+
+def test_required_remote_map_rejects_local_mode_conflict(monkeypatch):
+    monkeypatch.setenv("LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE", "true")
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "true")
+
+    with pytest.raises(ModelCostMapLoadError, match="conflicts"):
+        get_model_cost_map("https://example.invalid/prices.json")
+
+
+def test_reload_interval_requires_remote_mode(monkeypatch):
+    monkeypatch.setenv("LITELLM_MODEL_COST_MAP_RELOAD_INTERVAL_SECONDS", "300")
+    monkeypatch.delenv("LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE", raising=False)
+
+    with pytest.raises(ModelCostMapLoadError, match="requires"):
+        get_model_cost_map_reload_interval_seconds()
+
+
+@pytest.mark.parametrize("value", ["-1", "invalid"])
+def test_reload_interval_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE", "true")
+    monkeypatch.setenv("LITELLM_MODEL_COST_MAP_RELOAD_INTERVAL_SECONDS", value)
+
+    with pytest.raises(ModelCostMapLoadError, match="non-negative integer"):
+        get_model_cost_map_reload_interval_seconds()
 
 
 def test_count_model_entries_excludes_reserved_keys():

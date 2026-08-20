@@ -1024,7 +1024,15 @@ async def proxy_startup_event(app: FastAPI):
         shared_aiohttp_session
     import json
 
+    from litellm.litellm_core_utils.get_model_cost_map import (
+        get_model_cost_map_reload_interval_seconds,
+    )
+    from litellm.litellm_core_utils.model_cost_map_manager import (
+        model_cost_map_manager,
+    )
+
     init_verbose_loggers()
+    model_cost_map_reload_task: asyncio.Task[None] | None = None
 
     ## RUN WORKER STARTUP HOOKS (e.g., gflags initialization) ##
     _startup_hooks_env: Final = os.environ.get("LITELLM_WORKER_STARTUP_HOOKS", "")
@@ -1288,6 +1296,12 @@ async def proxy_startup_event(app: FastAPI):
     ## Initialize shared aiohttp session for connection reuse
     shared_aiohttp_session = await _initialize_shared_aiohttp_session()
 
+    model_cost_map_reload_interval_seconds = get_model_cost_map_reload_interval_seconds()
+    if model_cost_map_reload_interval_seconds is not None:
+        model_cost_map_reload_task = asyncio.create_task(
+            model_cost_map_manager.run_periodic_reload(model_cost_map_reload_interval_seconds)
+        )
+
     # End of startup event
     yield
 
@@ -1295,6 +1309,11 @@ async def proxy_startup_event(app: FastAPI):
     # so SIGTERM (rolling update, scale-down, liveness kill) doesn't drop them.
     GracefulShutdownManager.start_shutdown()
     await GracefulShutdownManager.wait_for_drain()
+
+    if model_cost_map_reload_task is not None:
+        model_cost_map_reload_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await model_cost_map_reload_task
 
     # Shutdown event - close shared aiohttp session
     if shared_aiohttp_session is not None:
@@ -6917,6 +6936,13 @@ class ProxyConfig:
         Runs on the periodic reload job, independently of `store_model_in_db`.
         """
         try:
+            from litellm.litellm_core_utils.get_model_cost_map import (
+                is_remote_model_cost_map_required,
+            )
+
+            if is_remote_model_cost_map_required():
+                return
+
             schedule = await read_reload_schedule(prisma_client, MODEL_COST_MAP_RELOAD_PARAM_NAME)
             if schedule is None:
                 return
@@ -16721,6 +16747,16 @@ async def reload_model_cost_map(
             detail=f"Access denied. Admin role required. Current role: {user_api_key_dict.user_role}",
         )
 
+    from litellm.litellm_core_utils.get_model_cost_map import (
+        is_remote_model_cost_map_required,
+    )
+
+    if is_remote_model_cost_map_required():
+        raise HTTPException(
+            status_code=409,
+            detail="Manual model cost map reload is disabled when LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE=true",
+        )
+
     try:
         global prisma_client
         if prisma_client is None:
@@ -16790,6 +16826,16 @@ async def schedule_model_cost_map_reload(
     if hours <= 0:
         raise HTTPException(status_code=400, detail="Hours must be greater than 0")
 
+    from litellm.litellm_core_utils.get_model_cost_map import (
+        is_remote_model_cost_map_required,
+    )
+
+    if is_remote_model_cost_map_required():
+        raise HTTPException(
+            status_code=409,
+            detail="Model cost map reload scheduling is disabled when LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE=true",
+        )
+
     try:
         global prisma_client
         if prisma_client is None:
@@ -16834,6 +16880,16 @@ async def cancel_model_cost_map_reload(
             detail=f"Access denied. Admin role required. Current role: {user_api_key_dict.user_role}",
         )
 
+    from litellm.litellm_core_utils.get_model_cost_map import (
+        is_remote_model_cost_map_required,
+    )
+
+    if is_remote_model_cost_map_required():
+        raise HTTPException(
+            status_code=409,
+            detail="Model cost map reload scheduling is disabled when LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE=true",
+        )
+
     try:
         global prisma_client
         if prisma_client is None:
@@ -16876,6 +16932,30 @@ async def get_model_cost_map_reload_status(
 
     try:
         global prisma_client
+
+        from litellm.litellm_core_utils.get_model_cost_map import (
+            get_model_cost_map_reload_interval_seconds,
+            get_model_cost_map_source_info,
+            is_remote_model_cost_map_required,
+        )
+
+        environment_interval_seconds = get_model_cost_map_reload_interval_seconds()
+        if is_remote_model_cost_map_required():
+            source_info = get_model_cost_map_source_info()
+            last_success_at = source_info.get("last_success_at")
+            next_run_at = source_info.get("next_run_at")
+            return {  # mutable-ok: FastAPI serializes this route response as JSON
+                "scheduled": environment_interval_seconds is not None,
+                "interval_hours": None,
+                "interval_seconds": environment_interval_seconds,
+                "managed_by": "environment",
+                "last_run": last_success_at,
+                "next_run": (
+                    next_run_at if environment_interval_seconds is not None and isinstance(next_run_at, str) else None
+                ),
+            }
+
+        verbose_proxy_logger.info("Checking model cost map reload status")
 
         if prisma_client is None:
             verbose_proxy_logger.info("No database connection, returning not scheduled")

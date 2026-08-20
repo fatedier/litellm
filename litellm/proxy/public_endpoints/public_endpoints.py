@@ -410,6 +410,16 @@ async def get_litellm_model_cost_map():
     import litellm
 
     try:
+        from litellm.litellm_core_utils.get_model_cost_map import (
+            get_required_remote_model_cost_map_snapshot,
+            is_remote_model_cost_map_required,
+        )
+
+        if is_remote_model_cost_map_required():
+            required_remote_snapshot = get_required_remote_model_cost_map_snapshot()
+            if required_remote_snapshot is None:
+                raise RuntimeError("Required remote model cost map snapshot is unavailable")
+            return required_remote_snapshot
         _model_cost_map: Final = litellm.model_cost
         return _model_cost_map
     except Exception as e:

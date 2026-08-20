@@ -3,6 +3,10 @@ Pulls the cost + context window + provider route for known models from https://g
 
 Set LITELLM_LOCAL_MODEL_COST_MAP=True to use the bundled local map, or set
 LITELLM_MODEL_COST_MAP_PATH to select a repository-managed or mounted JSON map.
+Set LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE=True to require an authoritative
+remote deployment catalog at startup. It replaces the bundled catalog and may
+contain only the models enabled for this deployment.
+LITELLM_MODEL_COST_MAP_RELOAD_INTERVAL_SECONDS enables proxy reloads.
 
 ```
 export LITELLM_LOCAL_MODEL_COST_MAP=True
@@ -14,13 +18,16 @@ import json
 import os
 import random
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
-from typing import Final, Optional, Protocol
+from typing import Dict, Final, List, Optional, Protocol, TypeAlias
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from pydantic import ConfigDict, TypeAdapter, ValidationError
 
 from litellm import verbose_logger
 from litellm.constants import (
@@ -32,10 +39,71 @@ from litellm.litellm_core_utils.fallback_generalizations import (
 )
 
 FALLBACK_GENERALIZATIONS_KEY: Final = "fallback_generalizations"
+RESERVED_TOP_LEVEL_KEYS: Final = frozenset({"sample_spec", FALLBACK_GENERALIZATIONS_KEY})
+REQUIRE_REMOTE_MODEL_COST_MAP_ENV = "LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE"
+RELOAD_INTERVAL_MODEL_COST_MAP_ENV = "LITELLM_MODEL_COST_MAP_RELOAD_INTERVAL_SECONDS"
 
 # Reserved top-level keys that are not model entries. They must be excluded
 # from the model-count integrity check so a real upstream shrink can't be masked.
-RESERVED_TOP_LEVEL_KEYS: Final = frozenset({"sample_spec", FALLBACK_GENERALIZATIONS_KEY})
+ModelCostEntry: TypeAlias = dict[str, object]  # mutable-ok: public runtime entries are updated by Router registration
+ModelCostMap: TypeAlias = dict[str, ModelCostEntry]  # mutable-ok: public runtime map is replaced during reload
+_MODEL_COST_MAP_ADAPTER: TypeAdapter[dict[str, dict[str, object]]] = TypeAdapter(  # mutable-ok: Pydantic schema adapter
+    dict[str, dict[str, object]], config=ConfigDict(strict=True)
+)
+_RAW_JSON_ADAPTER: TypeAdapter[object] = TypeAdapter(object)
+_ALIASES_ADAPTER: TypeAdapter[tuple[str, ...]] = TypeAdapter(tuple[str, ...])
+_RAW_MAP_ADAPTER: TypeAdapter[dict[str, object]] = TypeAdapter(  # mutable-ok: Pydantic schema adapter
+    dict[str, object], config=ConfigDict(strict=True)
+)
+
+
+class ModelCostMapLoadError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedModelCostMap:
+    model_cost: ModelCostMap
+    catalog_snapshot: ModelCostMap
+
+
+def is_remote_model_cost_map_required() -> bool:
+    return os.getenv(REQUIRE_REMOTE_MODEL_COST_MAP_ENV, "").strip().lower() == "true"
+
+
+def _redact_model_cost_map_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname or ""
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        return urlunsplit((parsed.scheme, f"{hostname}{port}", parsed.path, "", ""))
+    except ValueError:
+        return "<invalid-url>"
+
+
+def _utc_now_isoformat() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_model_cost_map_reload_interval_seconds() -> int | None:
+    raw_interval = os.getenv(RELOAD_INTERVAL_MODEL_COST_MAP_ENV)
+    if raw_interval is None or raw_interval.strip() in ("", "0"):
+        return None
+    try:
+        interval_seconds = int(raw_interval.strip())
+    except ValueError as exc:
+        raise ModelCostMapLoadError(f"{RELOAD_INTERVAL_MODEL_COST_MAP_ENV} must be a non-negative integer") from exc
+    if interval_seconds < 0:
+        raise ModelCostMapLoadError(f"{RELOAD_INTERVAL_MODEL_COST_MAP_ENV} must be a non-negative integer")
+    if interval_seconds == 0:
+        return None
+    if not is_remote_model_cost_map_required():
+        raise ModelCostMapLoadError(
+            f"{RELOAD_INTERVAL_MODEL_COST_MAP_ENV} requires {REQUIRE_REMOTE_MODEL_COST_MAP_ENV}=true"
+        )
+    return interval_seconds
 
 
 def _count_model_entries(model_cost: dict) -> int:
@@ -182,6 +250,63 @@ class GetModelCostMap:
         response: Final = httpx.get(url, timeout=timeout)
         response.raise_for_status()
         return response.json()
+
+    @staticmethod
+    def prepare_required_remote_model_cost_map(fetched_map: object) -> PreparedModelCostMap:
+        if not isinstance(fetched_map, dict) or not fetched_map:
+            raise ModelCostMapLoadError("Remote model cost map must be a non-empty JSON object")
+
+        raw_map = _RAW_MAP_ADAPTER.validate_python(fetched_map)  # pyright: ignore[reportAny]  # Pydantic validates JSON boundary
+        raw_entries: dict[str, object] = {  # mutable-ok: Pydantic validates this JSON boundary immediately below
+            model_name: model_info
+            for model_name, model_info in raw_map.items()
+            if model_name not in RESERVED_TOP_LEVEL_KEYS
+        }  # mutable-ok: Pydantic validates and normalizes this JSON boundary immediately below
+        if not raw_entries:
+            raise ModelCostMapLoadError("Remote model cost map must contain at least one model entry")
+
+        try:
+            prepared_entries = _MODEL_COST_MAP_ADAPTER.validate_python(raw_entries)
+        except ValidationError as exc:
+            raise ModelCostMapLoadError("Model cost map entries must map string keys to JSON objects") from exc
+        invalid_model_names = tuple(model_name for model_name in prepared_entries if not model_name.strip())
+        if invalid_model_names:
+            raise ModelCostMapLoadError("Remote model cost map keys must be non-empty strings")
+        for model_name, model_info in prepared_entries.items():
+            aliases = model_info.get("aliases")
+            if aliases is None:
+                continue
+            try:
+                parsed_aliases = _ALIASES_ADAPTER.validate_python(aliases)
+            except ValidationError as exc:
+                raise ModelCostMapLoadError(
+                    f"Remote model cost map entry {model_name!r} aliases must be an array of non-empty strings"
+                ) from exc
+            if any(not alias.strip() for alias in parsed_aliases):
+                raise ModelCostMapLoadError(
+                    f"Remote model cost map entry {model_name!r} aliases must be an array of non-empty strings"
+                )
+
+        catalog_snapshot = deepcopy(prepared_entries)
+        model_cost = _MODEL_COST_MAP_ADAPTER.validate_python(_expand_model_aliases(prepared_entries))
+        return PreparedModelCostMap(model_cost=model_cost, catalog_snapshot=catalog_snapshot)
+
+    @staticmethod
+    def load_required_remote_model_cost_map(url: str) -> PreparedModelCostMap:
+        try:
+            fetched_map = _RAW_JSON_ADAPTER.validate_python(
+                GetModelCostMap.fetch_remote_model_cost_map(  # pyright: ignore[reportUnknownMemberType]  # legacy API
+                    url
+                )
+            )
+            return GetModelCostMap.prepare_required_remote_model_cost_map(fetched_map)
+        except ModelCostMapLoadError:
+            raise
+        except Exception as exc:  # noqa: BLE001  # every required remote load failure must block startup
+            redacted_url = _redact_model_cost_map_url(url)
+            raise ModelCostMapLoadError(
+                f"Failed to load required remote model cost map from {redacted_url}: {type(exc).__name__}"
+            ) from None
 
 
 RETRYABLE_FETCH_STATUS_CODES: Final = frozenset({429, 500, 502, 503, 504})
@@ -356,10 +481,25 @@ class ModelCostMapSourceInfo:
     is_env_forced: bool = False
     fallback_reason: str | None = None
     loaded_at: "datetime | None" = None
+    required_remote: bool = False
+    reload_interval_seconds: int | None = None
+    last_attempt_at: str | None = None
+    last_success_at: str | None = None
+    next_run_at: str | None = None
+    last_error: str | None = None
+    remote_model_count: int | None = None
 
 
 # Module-level singleton tracking the source of the current cost map
 _cost_map_source_info: Final = ModelCostMapSourceInfo()
+
+
+class RequiredRemoteModelCostMapState:
+    keys: frozenset[str] = frozenset()
+    snapshot: ModelCostMap | None = None
+
+
+_required_remote_model_cost_map_state = RequiredRemoteModelCostMapState()
 
 
 def get_model_cost_map_source_info() -> dict:
@@ -377,12 +517,57 @@ def get_model_cost_map_source_info() -> dict:
         "url": _cost_map_source_info.url,
         "is_env_forced": _cost_map_source_info.is_env_forced,
         "fallback_reason": _cost_map_source_info.fallback_reason,
+        "required_remote": _cost_map_source_info.required_remote,
+        "reload_interval_seconds": _cost_map_source_info.reload_interval_seconds,
+        "last_attempt_at": _cost_map_source_info.last_attempt_at,
+        "last_success_at": _cost_map_source_info.last_success_at,
+        "next_run_at": _cost_map_source_info.next_run_at,
+        "last_error": _cost_map_source_info.last_error,
+        "remote_model_count": _cost_map_source_info.remote_model_count,
     }
 
 
 def get_model_cost_map_loaded_at() -> "datetime | None":
     """When this process last loaded its cost map, stamped at the start of every load"""
     return _cost_map_source_info.loaded_at
+
+
+def record_required_remote_model_cost_map_attempt() -> None:
+    _cost_map_source_info.last_attempt_at = _utc_now_isoformat()
+
+
+def record_required_remote_model_cost_map_failure(error: Exception) -> None:
+    _cost_map_source_info.last_error = f"{type(error).__name__}: {error}"
+
+
+def record_required_remote_model_cost_map_success(model_count: int) -> None:
+    completed_at = _utc_now_isoformat()
+    _cost_map_source_info.source = "remote"
+    _cost_map_source_info.fallback_reason = None
+    _cost_map_source_info.last_success_at = completed_at
+    _cost_map_source_info.last_error = None
+    _cost_map_source_info.remote_model_count = model_count
+
+
+def set_required_remote_model_cost_map_next_run_at(next_run_at: str | None) -> None:
+    _cost_map_source_info.next_run_at = next_run_at
+
+
+def get_required_remote_model_cost_map_snapshot() -> ModelCostMap | None:
+    snapshot = _required_remote_model_cost_map_state.snapshot
+    return deepcopy(snapshot) if snapshot is not None else None
+
+
+def set_required_remote_model_cost_map_snapshot(model_cost: ModelCostMap | None) -> None:
+    _required_remote_model_cost_map_state.snapshot = deepcopy(model_cost) if model_cost is not None else None
+
+
+def get_required_remote_model_cost_map_keys() -> frozenset[str]:
+    return _required_remote_model_cost_map_state.keys
+
+
+def set_required_remote_model_cost_map_keys(keys: frozenset[str]) -> None:
+    _required_remote_model_cost_map_state.keys = keys
 
 
 def _expand_model_aliases(model_cost: dict) -> dict:
@@ -456,10 +641,13 @@ def get_model_cost_map(url: str) -> dict:
     """
     Public entry point — returns the model cost map dict.
 
-    1. If ``LITELLM_MODEL_COST_MAP_PATH`` is set, uses that local map only.
-    2. Otherwise, if ``LITELLM_LOCAL_MODEL_COST_MAP`` is set, uses the bundled
+    1. If ``LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE`` is true, requires an
+       authoritative remote deployment catalog. It replaces the bundled catalog,
+       may contain fewer entries, and never falls back to or merges with local data.
+    2. If ``LITELLM_MODEL_COST_MAP_PATH`` is set, uses that local map only.
+    3. Otherwise, if ``LITELLM_LOCAL_MODEL_COST_MAP`` is set, uses the bundled
        local backup only.
-    3. Otherwise fetches from ``url``, validates integrity, and falls back
+    4. Otherwise fetches from ``url``, validates integrity, and falls back
        to the local backup on any failure.
 
     Only the backup model count is cached (a single int) for validation.
@@ -469,7 +657,39 @@ def get_model_cost_map(url: str) -> dict:
     _cost_map_source_info.loaded_at = datetime.now(timezone.utc)
     # Note: can't use get_secret_bool here — this runs during litellm.__init__
     # before litellm._key_management_settings is set.
+    required_remote = is_remote_model_cost_map_required()
+    reload_interval_seconds = get_model_cost_map_reload_interval_seconds()
+    _cost_map_source_info.required_remote = required_remote
+    _cost_map_source_info.reload_interval_seconds = reload_interval_seconds
+    if not required_remote:
+        set_required_remote_model_cost_map_snapshot(None)
+
     local_model_cost_map_path = os.getenv("LITELLM_MODEL_COST_MAP_PATH", "").strip()
+    local_model_cost_map_forced = os.getenv("LITELLM_LOCAL_MODEL_COST_MAP", "").lower() == "true"
+    if required_remote and (local_model_cost_map_path or local_model_cost_map_forced):
+        raise ModelCostMapLoadError(
+            f"{REQUIRE_REMOTE_MODEL_COST_MAP_ENV}=true conflicts with LITELLM_MODEL_COST_MAP_PATH and "
+            "LITELLM_LOCAL_MODEL_COST_MAP=true"
+        )
+
+    if required_remote:
+        _cost_map_source_info.source = "remote"
+        _cost_map_source_info.url = _redact_model_cost_map_url(url)
+        _cost_map_source_info.is_env_forced = False
+        _cost_map_source_info.fallback_reason = None
+        record_required_remote_model_cost_map_attempt()
+        try:
+            prepared = GetModelCostMap.load_required_remote_model_cost_map(url)
+        except Exception as exc:  # noqa: BLE001  # every required remote load failure must block startup
+            record_required_remote_model_cost_map_failure(exc)
+            raise
+        set_fallback_generalizations(None)
+        catalog_keys = frozenset(prepared.model_cost)
+        set_required_remote_model_cost_map_snapshot(prepared.catalog_snapshot)
+        set_required_remote_model_cost_map_keys(catalog_keys)
+        record_required_remote_model_cost_map_success(len(prepared.catalog_snapshot))
+        return prepared.model_cost
+
     if local_model_cost_map_path:
         _cost_map_source_info.source = "local"
         _cost_map_source_info.url = None
@@ -477,22 +697,23 @@ def get_model_cost_map(url: str) -> dict:
         _cost_map_source_info.fallback_reason = None
         return _expand_model_aliases(GetModelCostMap.load_local_model_cost_map(path=local_model_cost_map_path))
 
-    if os.getenv("LITELLM_LOCAL_MODEL_COST_MAP", "").lower() == "true":
+    if local_model_cost_map_forced:
         _cost_map_source_info.source = "local"
         _cost_map_source_info.url = None
         _cost_map_source_info.is_env_forced = True
         _cost_map_source_info.fallback_reason = None
         return _finalize_model_cost_map(GetModelCostMap.load_local_model_cost_map())
 
-    _cost_map_source_info.url = url
+    redacted_url = _redact_model_cost_map_url(url)
+    _cost_map_source_info.url = redacted_url
     _cost_map_source_info.is_env_forced = False
 
     try:
         content: Final = GetModelCostMap.fetch_remote_model_cost_map(url)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # preserve legacy fallback for every remote load failure
         verbose_logger.warning(
             "LiteLLM: Failed to fetch remote model cost map from %s: %s. Falling back to local backup.",
-            url,
+            redacted_url,
             str(e),
         )
         _cost_map_source_info.source = "local"
@@ -506,7 +727,7 @@ def get_model_cost_map(url: str) -> dict:
     ):
         verbose_logger.warning(
             "LiteLLM: Fetched model cost map failed integrity check. Using local backup instead. url=%s",
-            url,
+            redacted_url,
         )
         _cost_map_source_info.source = "local"
         _cost_map_source_info.fallback_reason = "Remote data failed integrity validation"

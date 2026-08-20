@@ -91,6 +91,43 @@ def test_get_litellm_model_cost_map_returns_cost_map():
     )
 
 
+def test_required_remote_model_cost_map_returns_authoritative_snapshot(monkeypatch):
+    import litellm
+    from litellm.litellm_core_utils.get_model_cost_map import (
+        get_required_remote_model_cost_map_snapshot,
+        set_required_remote_model_cost_map_snapshot,
+    )
+
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+    original_model_cost = litellm.model_cost
+    original_snapshot = get_required_remote_model_cost_map_snapshot()
+    monkeypatch.setenv("LITELLM_MODEL_COST_MAP_REQUIRE_REMOTE", "true")
+    authoritative_catalog = {
+        "catalog-model": {
+            "litellm_provider": "openai",
+            "input_cost_per_token": 0.001,
+        }
+    }
+    set_required_remote_model_cost_map_snapshot(authoritative_catalog)
+    litellm.model_cost = {
+        "catalog-model": {
+            "litellm_provider": "openai",
+            "input_cost_per_token": 0.5,
+        },
+        "runtime-deployment": {"input_cost_per_token": 0.25},
+    }
+
+    try:
+        response = client.get("/public/litellm_model_cost_map")
+        assert response.status_code == 200
+        assert response.json() == authoritative_catalog
+    finally:
+        litellm.model_cost = original_model_cost
+        set_required_remote_model_cost_map_snapshot(original_snapshot)
+
+
 def test_public_ai_hub_info_is_public_by_default(monkeypatch):
     app = FastAPI()
     app.include_router(router)

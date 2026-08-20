@@ -8,6 +8,7 @@ from typing import (
     Any,
     Final,
     Literal,
+    Optional,
     get_args,
 )
 
