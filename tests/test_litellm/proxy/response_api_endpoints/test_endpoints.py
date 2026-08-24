@@ -5,6 +5,7 @@ Test for response_api_endpoints/endpoints.py
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import fastapi
 import pytest
 from fastapi.testclient import TestClient
 
@@ -347,6 +348,94 @@ class TestWSSessionCostTracking:
             start_time=None,
             end_time=None,
         )
+
+
+class TestResponsesWebSocketEnvironmentGate:
+    @pytest.mark.parametrize("path", ("/v1/responses", "/responses"))
+    def test_disabled_rejects_websocket_routes(self, path: str):
+        from starlette.websockets import WebSocketDisconnect
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"LITELLM_DISABLE_RESPONSES_WEBSOCKET": "true"},
+            ),
+            pytest.raises(WebSocketDisconnect) as exc_info,
+            TestClient(app).websocket_connect(path),
+        ):
+            pass
+
+        assert exc_info.value.code == fastapi.status.WS_1008_POLICY_VIOLATION
+        assert exc_info.value.reason == "Responses WebSocket is disabled"
+
+    @pytest.mark.asyncio
+    async def test_disabled_does_not_query_readable_secret_manager(self):
+        import litellm
+        from litellm.proxy.response_api_endpoints.endpoints import (
+            _responses_websocket_auth,
+        )
+        from litellm.types.secret_managers.main import (
+            KeyManagementSettings,
+            KeyManagementSystem,
+        )
+
+        websocket = MagicMock()
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"LITELLM_DISABLE_RESPONSES_WEBSOCKET": "true"},
+            ),
+            patch.object(litellm, "secret_manager_client", MagicMock()),
+            patch.object(
+                litellm,
+                "_key_management_system",
+                KeyManagementSystem.AWS_SECRET_MANAGER,
+            ),
+            patch.object(
+                litellm,
+                "_key_management_settings",
+                KeyManagementSettings(access_mode="read_only", hosted_keys=None),
+            ),
+            patch(
+                "litellm.secret_managers.main.get_secret_from_manager",
+                return_value=None,
+            ) as mock_secret_lookup,
+            patch(
+                "litellm.proxy.response_api_endpoints.endpoints.user_api_key_auth_websocket",
+                new_callable=AsyncMock,
+            ) as mock_auth,
+            pytest.raises(fastapi.WebSocketException),
+        ):
+            await _responses_websocket_auth(websocket)
+
+        mock_secret_lookup.assert_not_called()
+        mock_auth.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_enabled_delegates_to_websocket_auth(self):
+        from litellm.proxy.response_api_endpoints.endpoints import (
+            _responses_websocket_auth,
+        )
+
+        websocket = MagicMock()
+        authenticated_user = MagicMock()
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"LITELLM_DISABLE_RESPONSES_WEBSOCKET": "false"},
+            ),
+            patch(
+                "litellm.proxy.response_api_endpoints.endpoints.user_api_key_auth_websocket",
+                new_callable=AsyncMock,
+                return_value=authenticated_user,
+            ) as mock_auth,
+        ):
+            result = await _responses_websocket_auth(websocket)
+
+        assert result is authenticated_user
+        mock_auth.assert_awaited_once_with(websocket)
 
 
 class TestWSModelExtraction:

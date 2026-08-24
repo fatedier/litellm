@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 from collections.abc import AsyncIterator, Mapping
 from types import MappingProxyType
@@ -26,7 +27,8 @@ from litellm.proxy.common_utils.http_parsing_utils import (
     _read_request_body,
     _safe_set_request_parsed_body,
 )
-from litellm.types.llms.openai import REASONING_EFFORT, ResponsesAPIResponse
+from litellm.secret_managers.main import str_to_bool
+from litellm.types.llms.openai import REASONING_EFFORT, ResponseAPIUsage, ResponsesAPIResponse
 from litellm.types.responses.main import DeleteResponseResult
 
 if TYPE_CHECKING:
@@ -1257,12 +1259,21 @@ async def _enforce_responses_ws_first_frame_model_auth(
     )
 
 
+async def _responses_websocket_auth(websocket: WebSocket) -> UserAPIKeyAuth:
+    if str_to_bool(os.getenv("LITELLM_DISABLE_RESPONSES_WEBSOCKET")) is True:
+        raise fastapi.WebSocketException(
+            code=fastapi.status.WS_1008_POLICY_VIOLATION,
+            reason="Responses WebSocket is disabled",
+        )
+    return await user_api_key_auth_websocket(websocket)
+
+
 @router.websocket("/v1/responses")
 @router.websocket("/responses")
 async def responses_websocket_endpoint(
     websocket: WebSocket,
     model: str | None = fastapi.Query(None, description="The model to use for the responses WebSocket session."),
-    user_api_key_dict=Depends(user_api_key_auth_websocket),
+    user_api_key_dict=Depends(_responses_websocket_auth),
 ):
     """
     Responses API WebSocket mode endpoint.
