@@ -4,7 +4,7 @@ Handler for the Anthropic v1/messages -> OpenAI Responses API path.
 Used when the target model is an OpenAI or Azure model.
 """
 
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator, Coroutine, Mapping
 from typing import Any, Final
 
 import litellm
@@ -23,6 +23,29 @@ from .streaming_iterator import AnthropicResponsesStreamWrapper
 from .transformation import LiteLLMAnthropicToResponsesAPIAdapter
 
 _ADAPTER: Final = LiteLLMAnthropicToResponsesAPIAdapter()
+
+
+def _get_claude_code_prompt_cache_key(extra_kwargs: Mapping[str, object]) -> str | None:
+    if "prompt_cache_key" in extra_kwargs and extra_kwargs["prompt_cache_key"] is not None:
+        return None
+
+    proxy_server_request: Final = extra_kwargs.get("proxy_server_request")
+    if not isinstance(proxy_server_request, Mapping):
+        return None
+
+    request_headers: Final = proxy_server_request.get("headers")
+    if not isinstance(request_headers, Mapping):
+        return None
+
+    claude_code_session_id: Final = next(
+        (
+            value
+            for key, value in request_headers.items()
+            if isinstance(key, str) and key.lower() == "x-claude-code-session-id"
+        ),
+        None,
+    )
+    return claude_code_session_id if isinstance(claude_code_session_id, str) and claude_code_session_id else None
 
 
 def _build_responses_kwargs(
@@ -77,6 +100,10 @@ def _build_responses_kwargs(
 
     anthropic_request: Final = AnthropicMessagesRequest(**request_data)
     responses_kwargs: Final = _ADAPTER.translate_request(anthropic_request)
+
+    claude_code_prompt_cache_key: Final = _get_claude_code_prompt_cache_key(extra_kwargs or {})
+    if claude_code_prompt_cache_key is not None:
+        responses_kwargs["prompt_cache_key"] = claude_code_prompt_cache_key
 
     # Normalize reasoning effort based on model capabilities
     # (e.g. "max" → "xhigh"/"high", "minimal" → "low" if unsupported)
