@@ -2986,12 +2986,17 @@ def _should_drop_param(k, additional_drop_params) -> bool:
     return False
 
 
-def _get_non_default_params(passed_params: dict, default_params: dict, additional_drop_params: list | None) -> dict:
+def _get_non_default_params(
+    passed_params: dict,
+    default_params: dict,
+    additional_drop_params: list | None,
+    additional_default_params: tuple[str, ...] = (),
+) -> dict:
     non_default_params: Final = {}
     for k, v in passed_params.items():
         if (
-            k in default_params
-            and v != default_params[k]
+            (k in default_params or k in additional_default_params)
+            and v != default_params.get(k)
             and _should_drop_param(k=k, additional_drop_params=additional_drop_params) is False
         ):
             non_default_params[k] = v
@@ -3142,6 +3147,9 @@ def get_optional_params_image_gen(
             continue
         passed_params[k] = v
 
+    provider_supported_params: Final = (
+        tuple(provider_config.get_supported_openai_params(model=model or "")) if provider_config is not None else ()
+    )
     default_params: Final = {
         "n": None,
         "quality": None,
@@ -3158,6 +3166,7 @@ def get_optional_params_image_gen(
         passed_params=passed_params,
         default_params=default_params,
         additional_drop_params=additional_drop_params,
+        additional_default_params=provider_supported_params,
     )
     optional_params: dict[str, object] = {}
 
@@ -3179,7 +3188,7 @@ def get_optional_params_image_gen(
             return non_default_params
 
     if provider_config is not None:
-        supported_params = provider_config.get_supported_openai_params(model=model or "")
+        supported_params = provider_supported_params
         _check_valid_arg(supported_params=supported_params)
         optional_params = provider_config.map_openai_params(
             non_default_params=non_default_params,
@@ -3213,8 +3222,7 @@ def get_optional_params_image_gen(
 
     openai_params: list[str] = list(default_params.keys())
     if provider_config is not None:
-        supported_params = provider_config.get_supported_openai_params(model=model or "")
-        openai_params = list(supported_params)
+        openai_params = list(provider_supported_params)
 
     optional_params = add_provider_specific_params_to_optional_params(
         optional_params=optional_params,
