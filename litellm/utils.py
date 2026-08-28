@@ -8394,11 +8394,11 @@ class ProviderConfigManager:
 
             return SonioxAudioTranscriptionConfig()
         elif litellm.LlmProviders.VERTEX_AI == provider:
-            from litellm.llms.vertex_ai.audio_transcription.transformation import (
-                VertexAIAudioTranscriptionConfig,
+            from litellm.llms.vertex_ai.audio_transcription.selector import (
+                get_vertex_audio_transcription_config,
             )
 
-            return VertexAIAudioTranscriptionConfig()
+            return get_vertex_audio_transcription_config(model=model)
         return None
 
     @staticmethod

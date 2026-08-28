@@ -551,6 +551,14 @@ def cost_per_token(
             data_residency=data_residency,
         )
     elif call_type == "atranscription" or call_type == "transcription":
+        if custom_llm_provider == "vertex_ai" and _transcription_usage_has_token_details(usage_block):
+            return generic_cost_per_token(
+                model=model_without_prefix,
+                usage=usage_block,
+                custom_llm_provider=custom_llm_provider,
+                service_tier=service_tier,
+                data_residency=data_residency,
+            )
         if _transcription_usage_has_token_details(usage_block):
             return openai_cost_per_token(
                 model=model_without_prefix,

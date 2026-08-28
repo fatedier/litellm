@@ -348,6 +348,69 @@ def test_transcription_cost_uses_token_pricing():
     assert pytest.approx(cost, rel=1e-6) == expected_cost
 
 
+def test_vertex_transcription_token_pricing_uses_provider_cost_map():
+    from unittest.mock import patch
+
+    usage = Usage(
+        prompt_tokens=70,
+        completion_tokens=12,
+        total_tokens=82,
+        prompt_tokens_details=PromptTokensDetailsWrapper(text_tokens=0, audio_tokens=70),
+    )
+
+    with (
+        patch("litellm.cost_calculator.generic_cost_per_token", return_value=(0.000175, 0.000144)) as generic,
+        patch("litellm.cost_calculator.openai_cost_per_token") as openai,
+    ):
+        result = cost_per_token(
+            model="vertex_ai/gemini-3.5-transcribe-preview",
+            custom_llm_provider="vertex_ai",
+            usage_object=usage,
+            call_type="atranscription",
+        )
+
+    assert result == (0.000175, 0.000144)
+    generic.assert_called_once_with(
+        model="gemini-3.5-transcribe-preview",
+        usage=usage,
+        custom_llm_provider="vertex_ai",
+        service_tier=None,
+        data_residency=None,
+    )
+    openai.assert_not_called()
+
+
+def test_non_vertex_transcription_token_pricing_keeps_openai_compatible_path():
+    from unittest.mock import patch
+
+    usage = Usage(
+        prompt_tokens=14,
+        completion_tokens=45,
+        total_tokens=59,
+        prompt_tokens_details=PromptTokensDetailsWrapper(text_tokens=0, audio_tokens=14),
+    )
+
+    with (
+        patch("litellm.cost_calculator.generic_cost_per_token") as generic,
+        patch("litellm.cost_calculator.openai_cost_per_token", return_value=(0.000035, 0.00045)) as openai,
+    ):
+        result = cost_per_token(
+            model="azure/gpt-4o-transcribe",
+            custom_llm_provider="azure",
+            usage_object=usage,
+            call_type="atranscription",
+        )
+
+    assert result == (0.000035, 0.00045)
+    openai.assert_called_once_with(
+        model="gpt-4o-transcribe",
+        usage=usage,
+        service_tier=None,
+        data_residency=None,
+    )
+    generic.assert_not_called()
+
+
 def test_transcription_cost_falls_back_to_duration():
     from litellm import completion_cost
 
