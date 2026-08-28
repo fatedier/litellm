@@ -1,0 +1,1 @@
+"""Nova Responses provider configuration."""

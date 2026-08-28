@@ -235,6 +235,7 @@ LLM_CONFIG_NAMES: Final = (
     "AzureOpenAIOSeriesResponsesAPIConfig",
     "XAIResponsesAPIConfig",
     "LiteLLMProxyResponsesAPIConfig",
+    "NovaResponsesAPIConfig",
     "HostedVLLMResponsesAPIConfig",
     "VolcEngineResponsesAPIConfig",
     "PerplexityResponsesConfig",
@@ -284,6 +285,8 @@ LLM_CONFIG_NAMES: Final = (
     "VolcEngineConfig",  # Alias for VolcEngineChatConfig
     "LlamafileChatConfig",
     "LiteLLMProxyChatConfig",
+    "NovaChatConfig",
+    "NovaMessagesConfig",
     "VLLMConfig",
     "DeepSeekChatConfig",
     "TencentChatConfig",
@@ -945,6 +948,10 @@ _LLM_CONFIGS_IMPORT_MAP: Final = {
         ".llms.litellm_proxy.responses.transformation",
         "LiteLLMProxyResponsesAPIConfig",
     ),
+    "NovaResponsesAPIConfig": (
+        ".llms.nova.responses.transformation",
+        "NovaResponsesAPIConfig",
+    ),
     "HostedVLLMResponsesAPIConfig": (
         ".llms.hosted_vllm.responses.transformation",
         "HostedVLLMResponsesAPIConfig",
@@ -1097,6 +1104,8 @@ _LLM_CONFIGS_IMPORT_MAP: Final = {
         ".llms.litellm_proxy.chat.transformation",
         "LiteLLMProxyChatConfig",
     ),
+    "NovaChatConfig": (".llms.nova.chat.transformation", "NovaChatConfig"),
+    "NovaMessagesConfig": (".llms.nova.messages.transformation", "NovaMessagesConfig"),
     "VLLMConfig": (".llms.vllm.completion.transformation", "VLLMConfig"),
     "DeepSeekChatConfig": (".llms.deepseek.chat.transformation", "DeepSeekChatConfig"),
     "TencentChatConfig": (".llms.tencent.chat.transformation", "TencentChatConfig"),

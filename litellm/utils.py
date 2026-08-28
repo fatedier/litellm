@@ -7942,6 +7942,7 @@ class ProviderConfigManager:
                 lambda: litellm.LiteLLMProxyChatConfig(),
                 False,
             ),
+            LlmProviders.NOVA: (lambda: litellm.NovaChatConfig(), False),
             LlmProviders.GRADIENT_AI: (lambda: litellm.GradientAIConfig(), False),
             LlmProviders.NSCALE: (lambda: litellm.NscaleConfig(), False),
             LlmProviders.HEROKU: (lambda: litellm.HerokuChatConfig(), False),
@@ -8290,6 +8291,10 @@ class ProviderConfigManager:
                 )
 
                 return GithubCopilotAnthropicMessagesConfig()
+        elif litellm.LlmProviders.NOVA == provider:
+            from litellm.llms.nova.messages.transformation import NovaMessagesConfig
+
+            return NovaMessagesConfig()
 
         from litellm.llms.openai_like.json_loader import JSONProviderRegistry
 
@@ -8474,6 +8479,8 @@ class ProviderConfigManager:
             return litellm.ChatGPTResponsesAPIConfig()
         elif litellm.LlmProviders.LITELLM_PROXY == provider:
             return litellm.LiteLLMProxyResponsesAPIConfig()
+        elif litellm.LlmProviders.NOVA == provider:
+            return litellm.NovaResponsesAPIConfig()
         elif litellm.LlmProviders.VOLCENGINE == provider:
             return litellm.VolcEngineResponsesAPIConfig()
         elif litellm.LlmProviders.MANUS == provider:
@@ -8577,6 +8584,8 @@ class ProviderConfigManager:
             return VertexAIModelInfo()
         elif LlmProviders.LITELLM_PROXY == provider:
             return litellm.LiteLLMProxyChatConfig()
+        elif LlmProviders.NOVA == provider:
+            return litellm.NovaChatConfig()
         elif LlmProviders.TOPAZ == provider:
             return litellm.TopazModelInfo()
         elif LlmProviders.ANTHROPIC == provider:

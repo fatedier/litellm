@@ -682,6 +682,12 @@ def _get_openai_compatible_provider_info(
             dynamic_api_key,
         ) = litellm.LiteLLMProxyChatConfig()._get_openai_compatible_provider_info(api_base=api_base, api_key=api_key)
 
+    elif custom_llm_provider == "nova":
+        (
+            api_base,
+            dynamic_api_key,
+        ) = litellm.NovaChatConfig()._get_openai_compatible_provider_info(api_base=api_base, api_key=api_key)
+
     elif custom_llm_provider == "mistral":
         (
             api_base,

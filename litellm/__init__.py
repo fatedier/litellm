@@ -1777,6 +1777,9 @@ if TYPE_CHECKING:
     from .llms.litellm_proxy.responses.transformation import (
         LiteLLMProxyResponsesAPIConfig as LiteLLMProxyResponsesAPIConfig,
     )
+    from .llms.nova.responses.transformation import (
+        NovaResponsesAPIConfig as NovaResponsesAPIConfig,
+    )
     from .llms.volcengine.responses.transformation import (
         VolcEngineResponsesAPIConfig as VolcEngineResponsesAPIConfig,
     )
@@ -1868,6 +1871,8 @@ if TYPE_CHECKING:
     from .llms.litellm_proxy.chat.transformation import (
         LiteLLMProxyChatConfig as _LiteLLMProxyChatConfig,
     )
+    from .llms.nova.chat.transformation import NovaChatConfig as _NovaChatConfig
+    from .llms.nova.messages.transformation import NovaMessagesConfig as _NovaMessagesConfig
     from .llms.deepinfra.chat.transformation import DeepInfraConfig as _DeepInfraConfig
     from .llms.llamafile.chat.transformation import (
         LlamafileChatConfig as _LlamafileChatConfig,
@@ -1897,6 +1902,8 @@ if TYPE_CHECKING:
     IBMWatsonXChatConfig: Type[_IBMWatsonXChatConfig]
     IBMWatsonXAIConfig: Type[_IBMWatsonXAIConfig]
     LiteLLMProxyChatConfig: Type[_LiteLLMProxyChatConfig]
+    NovaChatConfig: Type[_NovaChatConfig]
+    NovaMessagesConfig: Type[_NovaMessagesConfig]
     DeepInfraConfig: Type[_DeepInfraConfig]
     LlamafileChatConfig: Type[_LlamafileChatConfig]
     LMStudioChatConfig: Type[_LMStudioChatConfig]

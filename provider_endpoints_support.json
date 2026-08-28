@@ -1438,6 +1438,24 @@
         "interactions": true
       }
     },
+    "nova": {
+      "display_name": "Nova (`nova`)",
+      "url": "https://docs.litellm.ai/docs/providers",
+      "endpoints": {
+        "chat_completions": true,
+        "messages": true,
+        "responses": true,
+        "embeddings": false,
+        "image_generations": false,
+        "audio_transcriptions": false,
+        "audio_speech": false,
+        "moderations": false,
+        "batches": false,
+        "rerank": false,
+        "a2a": false,
+        "interactions": false
+      }
+    },
     "llamafile": {
       "display_name": "Llamafile (`llamafile`)",
       "url": "https://docs.litellm.ai/docs/providers/llamafile",
